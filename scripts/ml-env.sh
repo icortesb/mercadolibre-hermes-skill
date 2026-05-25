@@ -109,6 +109,28 @@ ml_load_token() {
          ML_ACCESS_TOKEN ML_REFRESH_TOKEN ML_USER_ID ML_EXPIRES_AT
 }
 
+# Resolve the current price for a catalog product.
+# Strategy: prefer .buy_box_winner.price; fall back to the minimum price across
+# the product's active offers when the product has pickers/variants (buy_box null).
+# Prints just the price number on success; empty string + non-zero on failure.
+# Usage: ml_product_price MLA63094449
+ml_product_price() {
+  local product_id="$1" resp price
+  [ -n "$product_id" ] || { echo "ml_product_price: missing product id" >&2; return 1; }
+  [ -n "${ML_ACCESS_TOKEN:-}" ] || { echo "ml_product_price: ML_ACCESS_TOKEN not set (call ml_load_token)" >&2; return 1; }
+
+  resp=$(curl -sS -H "Authorization: Bearer $ML_ACCESS_TOKEN" "$ML_API/products/${product_id}") || return 1
+  price=$(echo "$resp" | jq -r '.buy_box_winner.price // empty')
+
+  if [ -z "$price" ]; then
+    # Fall back to min price across active offers
+    price=$(curl -sS -H "Authorization: Bearer $ML_ACCESS_TOKEN" "$ML_API/products/${product_id}/items?limit=50" \
+      | jq -r '[.results[].price | select(. != null)] | if length == 0 then empty else min end')
+  fi
+
+  [ -n "$price" ] && printf '%s' "$price"
+}
+
 # Authenticated curl with retry on 401 (auto-refresh) and 429/5xx (exponential backoff).
 # Usage: ml_curl <url> [extra curl args]
 ml_curl() {

@@ -225,7 +225,29 @@ curl -s -H "Authorization: Bearer $ML_ACCESS_TOKEN" "$ML_API/products/${PRODUCT_
     }'
 ```
 
-`buy_box_winner.price` is the headline price shown on the product page — that's what we track. `min_price` / `max_price` give the full range across offers.
+`buy_box_winner.price` is the headline price shown on the product page — that's what we track for simple products.
+
+> **Heads up for multi-variant products**: products with `pickers` (size/colour/capacity selectors — e.g. a PS5 with capacity & colour pickers) have **no buy-box winner** at the parent level (`.buy_box_winner == null`, `.min_price == null`). For those, query the offers directly and take the cheapest:
+>
+> ```bash
+> curl -s -H "Authorization: Bearer $ML_ACCESS_TOKEN" "$ML_API/products/$PRODUCT_ID/items?limit=50" \
+>   | jq -r '[.results[].price | select(. != null)] | min'
+> ```
+>
+> The bundled `ml_product_price` helper does this fallback automatically — see below.
+
+### Resolve a product's current price (helper)
+
+The `ml_product_price` function in `ml-env.sh` returns the current price for a product, falling back from `buy_box_winner.price` to `min(offers)` when the product has variants:
+
+```bash
+source skills/mercadolibre/scripts/ml-env.sh && ml_load_token
+PRICE=$(ml_product_price MLA63094449)
+echo "$PRICE"
+# → 1159999  (the cheapest active offer)
+```
+
+Use this anywhere you'd otherwise hand-roll the buy-box lookup; it makes the tracking and alerting recipes work uniformly across simple and multi-variant products.
 
 ### Resolve a product ID from a MercadoLibre URL
 
@@ -246,22 +268,23 @@ If the user shares an `articulo.mercadolibre.com.ar/MLA-XXXX-...` URL instead (w
 
 MercadoLibre's API does **not** expose historical prices. We snapshot the `buy_box_winner.price` locally and compare on each check.
 
-**Add a product to tracking:**
+**Add a product to tracking:** (uses `ml_product_price`, which handles multi-variant products automatically)
 
 ```bash
+source skills/mercadolibre/scripts/ml-env.sh && ml_load_token
+
 mkdir -p ~/.hermes/mercadolibre
 TRACK_FILE=~/.hermes/mercadolibre/tracked.json
 [ ! -f "$TRACK_FILE" ] && echo '{}' > "$TRACK_FILE"
 
 PRODUCT_ID="MLA63094449"
-THRESHOLD_PCT=10        # alert when buy-box price drops at least this much vs. baseline
+THRESHOLD_PCT=10        # alert when price drops at least this much vs. baseline
 
-INFO=$(curl -s -H "Authorization: Bearer $ML_ACCESS_TOKEN" "$ML_API/products/${PRODUCT_ID}")
-PRICE=$(echo "$INFO" | jq -r '.buy_box_winner.price // empty')
-TITLE=$(echo "$INFO" | jq -r .name)
+TITLE=$(curl -s -H "Authorization: Bearer $ML_ACCESS_TOKEN" "$ML_API/products/${PRODUCT_ID}" | jq -r .name)
+PRICE=$(ml_product_price "$PRODUCT_ID")
 
 if [ -z "$PRICE" ]; then
-  echo "No buy_box for ${PRODUCT_ID} (product may be out of stock); cannot establish baseline" >&2
+  echo "No active offers for ${PRODUCT_ID}; cannot establish baseline" >&2
   exit 1
 fi
 
