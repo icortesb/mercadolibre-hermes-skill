@@ -17,6 +17,19 @@ export ML_API="${ML_API:-https://api.mercadolibre.com}"
 
 _ml_die() { echo "ml-env: $*" >&2; return 1; }
 
+_ml_check_deps() {
+  local missing=()
+  command -v curl >/dev/null 2>&1 || missing+=(curl)
+  command -v jq   >/dev/null 2>&1 || missing+=(jq)
+  if [ ${#missing[@]} -gt 0 ]; then
+    local here
+    here="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+    echo "ml-env: missing required tools: ${missing[*]}" >&2
+    echo "  Run: bash ${here:-scripts}/install-deps.sh" >&2
+    return 1
+  fi
+}
+
 _ml_read_env() {
   [ -f "$ML_ENV_FILE" ] || { _ml_die "missing $ML_ENV_FILE — run ml-oauth.sh first"; return 1; }
   # shellcheck disable=SC1090
@@ -38,7 +51,8 @@ _ml_write_env_var() {
 }
 
 ml_refresh_token() {
-  _ml_read_env || return 1
+  _ml_check_deps || return 1
+  _ml_read_env   || return 1
   [ -n "${ML_CLIENT_ID:-}" ]     || { _ml_die "ML_CLIENT_ID not set";     return 1; }
   [ -n "${ML_CLIENT_SECRET:-}" ] || { _ml_die "ML_CLIENT_SECRET not set"; return 1; }
   [ -n "${ML_REFRESH_TOKEN:-}" ] || { _ml_die "ML_REFRESH_TOKEN not set — re-run ml-oauth.sh"; return 1; }
@@ -80,7 +94,8 @@ ml_refresh_token() {
 }
 
 ml_load_token() {
-  _ml_read_env || return 1
+  _ml_check_deps || return 1
+  _ml_read_env   || return 1
 
   local now expiry
   now=$(date +%s)

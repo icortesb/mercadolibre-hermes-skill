@@ -13,6 +13,14 @@
 
 set -euo pipefail
 
+for cmd in curl jq; do
+  command -v "$cmd" >/dev/null 2>&1 || {
+    echo "missing required tool: $cmd" >&2
+    echo "  Run: bash $(dirname "$0")/install-deps.sh" >&2
+    exit 1
+  }
+done
+
 ML_API="${ML_API:-https://api.mercadolibre.com}"
 TRACK_DIR="${TRACK_DIR:-$HOME/.hermes/mercadolibre}"
 TRACK_FILE="${TRACK_FILE:-$TRACK_DIR/tracked.json}"

@@ -24,6 +24,14 @@ Make the helper scripts executable:
 chmod +x ~/.hermes/skills/mercadolibre/scripts/*.sh
 ```
 
+Install runtime dependencies (`curl`, `jq`) — the bundled helper auto-detects your package manager:
+
+```bash
+bash ~/.hermes/skills/mercadolibre/scripts/install-deps.sh
+```
+
+Supported: `apt`, `dnf`, `yum`, `apk`, `pacman`, `zypper`, `brew`. If your system isn't covered, install `curl` and `jq` manually before continuing.
+
 ## Configure
 
 1. Create an app at https://developers.mercadolibre.com.ar/devcenter
@@ -69,6 +77,7 @@ Hermes will load `SKILL.md` automatically when these intents come up.
 | `scripts/ml-env.sh` | Source-able token loader + auto-refresh |
 | `scripts/ml-oauth.sh` | Interactive first-time OAuth flow |
 | `scripts/ml-check-tracked.sh` | Cron-friendly tracked-items checker (alerts on price drops) |
+| `scripts/install-deps.sh` | Auto-detect package manager and install `curl` + `jq` |
 
 Tracking state is stored at `~/.hermes/mercadolibre/tracked.json`.
 
