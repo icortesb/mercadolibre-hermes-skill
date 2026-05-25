@@ -1,7 +1,7 @@
 ---
 name: mercadolibre
-description: "MercadoLibre integration for buyers (search, price tracking with drop alerts, price history) and sellers (active listings, unanswered questions, competitor comparison, expiration alerts) using the official REST API and OAuth2."
-version: 1.0.0
+description: "MercadoLibre integration for buyers (catalog search, product price tracking with drop alerts, price history) and sellers (active listings, unanswered questions, competitor comparison via catalog offers, expiration alerts) using the official REST API and OAuth2. Works on non-validated apps via the catalog/product endpoints."
+version: 1.1.0
 author: Hermes Agent
 license: MIT
 platforms: [linux, macos, windows]
@@ -13,7 +13,9 @@ metadata:
 
 # MercadoLibre Integration
 
-This skill lets the agent work with MercadoLibre as both **buyer** and **seller** through the official REST API at `https://api.mercadolibre.com`. It handles OAuth2 authentication, automatic token refresh, product search, local price snapshotting with drop alerts, and seller-side monitoring (listings, questions, competitor prices, expiration windows).
+This skill lets the agent work with MercadoLibre as both **buyer** and **seller** through the official REST API at `https://api.mercadolibre.com`. It handles OAuth2 authentication, automatic token refresh, catalog product search, local price snapshotting with drop alerts, and seller-side monitoring (listings, questions, competitor prices, expiration windows).
+
+Buyer flows use the **catalog/product API** (`/products/*`), which works on any authenticated app — no MercadoLibre validation step needed for typical price-tracking and shopping use cases.
 
 API reference: https://developers.mercadolibre.com.ar
 
@@ -172,69 +174,99 @@ The helper:
 3. Persists the rotated tokens back to `~/.hermes/.env`
 4. Exports everything for the current shell
 
-For unauthenticated buyer-side queries (search, public item details) the access token is **not required** — only set `ML_SITE` and `ML_API`.
+All endpoints require `Authorization: Bearer ${ML_ACCESS_TOKEN}`. Even reads that used to be public (search, item details) are now gated since the 2024 MercadoLibre API hardening.
+
+> ### Heads-up: non-validated apps have catalog restrictions
+>
+> A freshly-created MercadoLibre app can hit `/users/me`, `/users/$ID/items/...` (your own data), and the **catalog/product API** (`/products/*`) — but **`/items/{id}` and `/sites/$SITE/search` return `403 access_denied` until the app is validated** by MercadoLibre. For most buyer flows the catalog API is actually a better choice (it aggregates all sellers for a product, exposes a `buy_box_winner.price`, and keeps the same ID even when individual listings come and go). The recipes below default to `/products/*`. If your app is validated and you want item-level data, see "App validation" near the end.
 
 ---
 
-## Buyer flows
+## Buyer flows (catalog-based, work on any app)
 
-### Search products
+### Search the catalog
 
 ```bash
 source skills/mercadolibre/scripts/ml-env.sh && ml_load_token
-QUERY="iphone 15 pro 256"
+QUERY="playstation 5"
 SITE="${ML_SITE:-MLA}"
 Q=$(printf %s "$QUERY" | jq -sRr @uri)
 
-curl -s "$ML_API/sites/${SITE}/search?q=${Q}&limit=10" \
-  | jq '.results[] | {title, price, currency_id, condition, sold_quantity, permalink, id, seller: .seller.nickname}'
+curl -s -H "Authorization: Bearer $ML_ACCESS_TOKEN" \
+  "$ML_API/products/search?site_id=${SITE}&status=active&q=${Q}&limit=10" \
+  | jq '.results[] | {id, name, domain_id}'
 ```
 
-Common filters (appended as query params):
+The catalog `id` (a.k.a. `catalog_product_id`) is what `/p/MLA...` URLs use on the website.
 
-- `&condition=new` or `condition=used`
-- `&sort=price_asc` (cheapest first), `price_desc`, `relevance`
-- `&shipping_cost=free`
-- `&category=MLA1055`
-- `&price=*-50000` (under 50000), `&price=10000-50000` (range)
-- `&limit=50&offset=50` (pagination — max `limit` is 50)
+Common filters:
 
-### Get item details
+- `&domain_id=MLA-CELLPHONES` — narrows to a domain (categories aren't used here; domain IDs are)
+- `&status=active` — only currently-sellable products (recommended default)
+- `&limit=50&offset=50` — pagination (max `limit` is 50)
+- `&attribute_id=BRAND&attribute_value=Apple` — filter by attribute
+
+### Get a product (with the current best price)
 
 ```bash
-ITEM_ID="MLA123456789"
-curl -s "$ML_API/items/${ITEM_ID}" \
-  | jq '{id, title, price, original_price, currency_id, available_quantity, sold_quantity, condition, permalink, seller_id, status, date_created, category_id}'
+PRODUCT_ID="MLA63094449"     # from the website URL: /p/MLA63094449
+curl -s -H "Authorization: Bearer $ML_ACCESS_TOKEN" "$ML_API/products/${PRODUCT_ID}" \
+  | jq '{
+      id,
+      name,
+      status,
+      buy_box_price:    .buy_box_winner.price,
+      buy_box_currency: .buy_box_winner.currency_id,
+      buy_box_seller:   .buy_box_winner.seller_id,
+      buy_box_item:     .buy_box_winner.item_id,
+      offers:           .offers_count,
+      min_price:        .min_price,
+      max_price:        .max_price
+    }'
 ```
 
-To resolve an item from a permalink, extract the ID from the URL (it's the `MLA-...` segment after the last `/`) and strip the dash:
+`buy_box_winner.price` is the headline price shown on the product page — that's what we track. `min_price` / `max_price` give the full range across offers.
+
+### Resolve a product ID from a MercadoLibre URL
 
 ```bash
-# https://articulo.mercadolibre.com.ar/MLA-123456789-... → MLA123456789
-URL="$1"
-ITEM_ID=$(echo "$URL" | grep -oE '(MLA|MLB|MLM|MLC|MCO|MLU)-?[0-9]+' | tr -d '-')
+# Accepts: https://www.mercadolibre.com.ar/.../p/MLA63094449#... → MLA63094449
+url_to_product_id() {
+  printf %s "$1" | grep -oE '/p/(MLA|MLB|MLM|MLC|MCO|MLU)[0-9]+' | head -1 | sed 's|/p/||'
+}
+
+# Example:
+url_to_product_id "https://www.mercadolibre.com.ar/sony-playstation-5/p/MLA63094449#x=1"
+# → MLA63094449
 ```
 
-### Track a price (local snapshots, drop alerts)
+If the user shares an `articulo.mercadolibre.com.ar/MLA-XXXX-...` URL instead (which points to a specific seller's listing, not the catalog), they may need to open the listing and follow "Ver publicación del catálogo" to get the `/p/MLA...` URL.
 
-MercadoLibre's API does **not** expose historical prices. To support "alert me if X drops Y%", snapshot prices locally and compare on each check.
+### Track a product's price (local snapshots, drop alerts)
 
-**Add an item to tracking:**
+MercadoLibre's API does **not** expose historical prices. We snapshot the `buy_box_winner.price` locally and compare on each check.
+
+**Add a product to tracking:**
 
 ```bash
 mkdir -p ~/.hermes/mercadolibre
 TRACK_FILE=~/.hermes/mercadolibre/tracked.json
 [ ! -f "$TRACK_FILE" ] && echo '{}' > "$TRACK_FILE"
 
-ITEM_ID="MLA123456789"
-THRESHOLD_PCT=10      # alert when price drops this much vs. baseline
+PRODUCT_ID="MLA63094449"
+THRESHOLD_PCT=10        # alert when buy-box price drops at least this much vs. baseline
 
-INFO=$(curl -s "$ML_API/items/${ITEM_ID}")
-PRICE=$(echo "$INFO" | jq -r .price)
-TITLE=$(echo "$INFO" | jq -r .title)
+INFO=$(curl -s -H "Authorization: Bearer $ML_ACCESS_TOKEN" "$ML_API/products/${PRODUCT_ID}")
+PRICE=$(echo "$INFO" | jq -r '.buy_box_winner.price // empty')
+TITLE=$(echo "$INFO" | jq -r .name)
+
+if [ -z "$PRICE" ]; then
+  echo "No buy_box for ${PRODUCT_ID} (product may be out of stock); cannot establish baseline" >&2
+  exit 1
+fi
+
 NOW=$(date +%s)
-
-jq --arg id "$ITEM_ID" \
+jq --arg id "$PRODUCT_ID" \
    --arg title "$TITLE" \
    --argjson price "$PRICE" \
    --argjson pct "$THRESHOLD_PCT" \
@@ -245,49 +277,24 @@ jq --arg id "$ITEM_ID" \
 echo "Tracking $TITLE @ $PRICE (alert if drops ≥${THRESHOLD_PCT}%)"
 ```
 
-**Check tracked items and emit alerts:**
+**Check tracked products and emit alerts:** use the bundled `scripts/ml-check-tracked.sh` (it loops, snapshots, and prints `ALERT ...` lines). Cron-friendly.
 
-```bash
-TRACK_FILE=~/.hermes/mercadolibre/tracked.json
-for ID in $(jq -r 'keys[]' "$TRACK_FILE"); do
-  CURRENT=$(curl -s "$ML_API/items/${ID}" | jq -r .price)
-  [ "$CURRENT" = null ] && continue       # item removed/unavailable
-
-  BASELINE=$(jq -r --arg id "$ID" '.[$id].baseline'      "$TRACK_FILE")
-  THRESHOLD=$(jq -r --arg id "$ID" '.[$id].threshold_pct' "$TRACK_FILE")
-  TITLE=$(jq -r    --arg id "$ID" '.[$id].title'         "$TRACK_FILE")
-  TS=$(date +%s)
-
-  # Append snapshot to history
-  jq --arg id "$ID" --argjson p "$CURRENT" --argjson t "$TS" \
-    '.[$id].history += [{ts:$t, price:$p}] | .[$id].last = $p' \
-    "$TRACK_FILE" > "$TRACK_FILE.tmp" && mv "$TRACK_FILE.tmp" "$TRACK_FILE"
-
-  DROP=$(awk -v b="$BASELINE" -v c="$CURRENT" 'BEGIN{ printf "%.2f", (b-c)/b*100 }')
-  if awk -v d="$DROP" -v t="$THRESHOLD" 'BEGIN{ exit !(d >= t) }'; then
-    echo "ALERT: $TITLE dropped ${DROP}% (baseline=${BASELINE}, now=${CURRENT}) — https://mercadolibre.com/p/${ID}"
-  fi
-done
-```
-
-For automatic background alerts, schedule via cron (every 4 hours):
+For automatic background alerts (every 4 hours):
 
 ```cron
 0 */4 * * * source $HOME/.hermes/skills/mercadolibre/scripts/ml-env.sh && ml_load_token && bash $HOME/.hermes/skills/mercadolibre/scripts/ml-check-tracked.sh >> $HOME/.hermes/mercadolibre/alerts.log 2>&1
 ```
 
-### View price history of a tracked item
+### View price history of a tracked product
 
 ```bash
-ITEM_ID="MLA123456789"
-jq -r --arg id "$ITEM_ID" \
+PRODUCT_ID="MLA63094449"
+jq -r --arg id "$PRODUCT_ID" \
   '.[$id].history[] | "\(.ts | strftime("%Y-%m-%d %H:%M"))  \(.price)"' \
   ~/.hermes/mercadolibre/tracked.json
 ```
 
-Or visualize as a quick ASCII sparkline using `gnuplot`/`spark` if installed.
-
-### Untrack / list tracked items
+### Untrack / list tracked products
 
 ```bash
 # List
@@ -295,25 +302,21 @@ jq 'to_entries | map({id:.key, title:.value.title, baseline:.value.baseline, las
   ~/.hermes/mercadolibre/tracked.json
 
 # Remove
-ITEM_ID="MLA123456789"
+PRODUCT_ID="MLA63094449"
 TRACK_FILE=~/.hermes/mercadolibre/tracked.json
-jq "del(.\"$ITEM_ID\")" "$TRACK_FILE" > "$TRACK_FILE.tmp" && mv "$TRACK_FILE.tmp" "$TRACK_FILE"
+jq "del(.\"$PRODUCT_ID\")" "$TRACK_FILE" > "$TRACK_FILE.tmp" && mv "$TRACK_FILE.tmp" "$TRACK_FILE"
 ```
 
-### MercadoLibre-native bookmarks (favorites)
-
-These touch the user's actual MercadoLibre account, not our local tracking file:
+### List offers for a product (compare sellers)
 
 ```bash
-ml_load_token
-ITEM_ID="MLA123456789"
-curl -s -X POST "$ML_API/users/${ML_USER_ID}/bookmarks" \
-  -H "Authorization: Bearer ${ML_ACCESS_TOKEN}" \
-  -H "Content-Type: application/json" \
-  -d "{\"item_id\":\"${ITEM_ID}\"}"
+PRODUCT_ID="MLA63094449"
+curl -s -H "Authorization: Bearer $ML_ACCESS_TOKEN" \
+  "$ML_API/products/${PRODUCT_ID}/items?limit=10" \
+  | jq '.results[] | {item_id, price, seller_id, condition, listing_type_id}'
 ```
 
-Prefer the local snapshot method for price tracking — it gives you historical data MercadoLibre doesn't expose.
+Useful when the user wants to see who else is selling the same product and at what price (the seller_id resolves to a nickname via `/users/${seller_id}`).
 
 ---
 
@@ -372,29 +375,35 @@ Cron-based alert (every hour during business hours):
 
 ### Compare your prices with competitors
 
-For one of your listings, search the same category/keywords and rank competitors by relative price:
+If your listing belongs to a catalog product (most new-condition listings do), the cleanest comparison is via the product's offers list — every other seller on the same catalog product, ranked by price:
 
 ```bash
 ml_load_token
 MY_ITEM="MLA123456789"
-SITE="${ML_SITE:-MLA}"
 
-INFO=$(curl -s "$ML_API/items/${MY_ITEM}")
-MY_PRICE=$(echo "$INFO" | jq -r .price)
-MY_TITLE=$(echo "$INFO" | jq -r .title)
-CATEGORY=$(echo "$INFO" | jq -r .category_id)
-Q=$(printf %s "$MY_TITLE" | jq -sRr @uri)
+INFO=$(curl -s -H "Authorization: Bearer $ML_ACCESS_TOKEN" "$ML_API/items/${MY_ITEM}")
+MY_PRICE=$(echo "$INFO"   | jq -r .price)
+MY_TITLE=$(echo "$INFO"   | jq -r .title)
+PRODUCT_ID=$(echo "$INFO" | jq -r '.catalog_product_id // empty')
 
-echo "Your listing: $MY_TITLE @ $MY_PRICE"
+if [ -z "$PRODUCT_ID" ]; then
+  echo "Listing $MY_ITEM isn't bound to a catalog product — comparison falls back to keyword search (requires validated app)." >&2
+  exit 1
+fi
+
+echo "Your listing: $MY_TITLE @ $MY_PRICE  (catalog: $PRODUCT_ID)"
 echo
 
-curl -s "$ML_API/sites/${SITE}/search?q=${Q}&category=${CATEGORY}&limit=10" \
+curl -s -H "Authorization: Bearer $ML_ACCESS_TOKEN" "$ML_API/products/${PRODUCT_ID}/items?limit=20" \
   | jq --argjson mine "$MY_PRICE" --arg myid "$MY_ITEM" \
-      '.results[] | select(.id != $myid) |
-       {title, price, diff_pct: (((.price - $mine) / $mine) * 100 | floor), permalink, seller: .seller.nickname}'
+      '.results[]
+        | select(.item_id != $myid)
+        | {item_id, price, seller_id, diff_pct: (((.price - $mine) / $mine) * 100 | floor)}'
 ```
 
-A negative `diff_pct` means the competitor is cheaper; positive means yours is cheaper.
+Negative `diff_pct` = competitor is cheaper, positive = yours is cheaper.
+
+For non-catalog listings (used items, unique handmade pieces) you need keyword-based search, which requires app validation.
 
 ### Listings expiring soon
 
@@ -477,10 +486,38 @@ ml_curl() {
 | 400  | `invalid_grant` | Refresh token rotated/revoked | Re-run OAuth flow |
 | 400  | `invalid_client` | Wrong client_id/secret | Check `~/.hermes/.env` |
 | 401  | `invalid_token` | Access token expired | `ml_refresh_token`, retry |
-| 403  | `forbidden` | Missing scope (need `write` for POST/PUT) | Re-authorize with proper scopes |
-| 404  | `not_found` | Item removed, or wrong site code | Verify `ITEM_ID` and `ML_SITE` |
+| 403  | `forbidden` (on POST/PUT) | App missing `write` scope | Re-authorize with proper scopes |
+| 403  | `access_denied` (on `/items/{id}` or `/sites/.../search`) | App not validated for catalog access | Use `/products/*` instead, or request app validation (see below) |
+| 404  | `not_found` | Item removed, or wrong site code | Verify ID and `ML_SITE` |
 | 429  | `too_many_requests` | Rate limited | Exponential backoff |
 | 5xx  | — | MercadoLibre transient | Retry with backoff |
+
+---
+
+## App validation (optional — only needed for `/items/*` and keyword search)
+
+A freshly-created MercadoLibre app can use:
+
+- All authentication endpoints (token exchange, refresh)
+- All data scoped to the app owner (`/users/me`, `/users/$ID/items/search`, `/my/received_questions/...`, `/orders/search?seller=$ID`)
+- The full **catalog/product API** (`/products/search`, `/products/{id}`, `/products/{id}/items`)
+
+But these endpoints are restricted until the app is **validated** by MercadoLibre:
+
+- `/items/{item_id}` for items not owned by the app owner
+- `/sites/$SITE/search?q=...` (keyword search across listings)
+- Various detailed catalog browsing endpoints
+
+For most "agent-as-personal-shopper" use cases, the catalog API is enough — it covers price tracking, product lookup, and seller comparison.
+
+If you do need item-level access (e.g. tracking used items that aren't in the catalog), request validation:
+
+1. Go to https://developers.mercadolibre.com.ar/devcenter/applications
+2. Open your app → look for "Solicitar validación" or "Publicar app"
+3. Submit a use-case description ("personal AI agent for own buyer/seller workflow" is legitimate)
+4. Approval typically takes 1–3 business days
+
+While the request is pending, the catalog-based recipes in this skill continue to work as-is.
 
 ---
 
@@ -497,12 +534,15 @@ ml_curl() {
 | Task | Command |
 |------|---------|
 | First-time auth | `bash skills/mercadolibre/scripts/ml-oauth.sh` |
+| Install deps | `bash skills/mercadolibre/scripts/install-deps.sh` |
 | Load + refresh token | `source skills/mercadolibre/scripts/ml-env.sh && ml_load_token` |
 | Force refresh | `ml_refresh_token` |
-| Search | `curl "$ML_API/sites/$ML_SITE/search?q=..."` |
-| Item details | `curl "$ML_API/items/$ITEM_ID"` |
+| Catalog search | `curl -H "Authorization: Bearer $ML_ACCESS_TOKEN" "$ML_API/products/search?site_id=$ML_SITE&status=active&q=..."` |
+| Product details | `curl -H "Authorization: Bearer $ML_ACCESS_TOKEN" "$ML_API/products/$PRODUCT_ID"` |
+| Sellers offering a product | `curl -H "Authorization: Bearer $ML_ACCESS_TOKEN" "$ML_API/products/$PRODUCT_ID/items"` |
+| My profile | `curl -H "Authorization: Bearer $ML_ACCESS_TOKEN" "$ML_API/users/me"` |
 | My active listings | `curl -H "Authorization: Bearer $ML_ACCESS_TOKEN" "$ML_API/users/$ML_USER_ID/items/search?status=active"` |
 | Unanswered questions | `curl -H "Authorization: Bearer $ML_ACCESS_TOKEN" "$ML_API/my/received_questions/search?status=UNANSWERED"` |
 | Answer a question | `POST $ML_API/answers` with `{question_id, text}` |
-| Track item locally | append entry to `~/.hermes/mercadolibre/tracked.json` |
+| Track product locally | append entry to `~/.hermes/mercadolibre/tracked.json` |
 | Check tracked + alert | `bash skills/mercadolibre/scripts/ml-check-tracked.sh` |

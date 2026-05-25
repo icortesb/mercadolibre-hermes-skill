@@ -1,8 +1,10 @@
 # mercadolibre — Hermes Agent skill
 
-Integrate MercadoLibre into Hermes so the agent can act as a **buyer** (search, price tracking with drop alerts, price history) and as a **seller** (active-listings overview, unanswered questions, competitor price comparison, expiration alerts).
+Integrate MercadoLibre into Hermes so the agent can act as a **buyer** (catalog search, product price tracking with drop alerts, price history) and as a **seller** (active-listings overview, unanswered questions, competitor price comparison via catalog offers, expiration alerts).
 
-Covers MercadoLibre Argentina, Brazil, Mexico, Chile, Colombia, and Uruguay (any site that uses the public API at `https://api.mercadolibre.com`).
+Covers MercadoLibre Argentina, Brazil, Mexico, Chile, Colombia, and Uruguay (any site that uses the API at `https://api.mercadolibre.com`).
+
+Buyer flows are built on the **catalog/product API** (`/products/*`), which works on any authenticated app — no MercadoLibre app-validation step required for typical price-tracking and shopping use cases. See `SKILL.md` → "App validation" if you also need item-level (`/items/{id}`) or keyword-search access.
 
 ## Install
 
@@ -58,12 +60,12 @@ Supported: `apt`, `dnf`, `yum`, `apk`, `pacman`, `zypper`, `brew`. If your syste
 
 Once configured, ask Hermes things like:
 
-- "Find the cheapest iPhone 15 Pro 256GB on MercadoLibre Argentina"
-- "Track this listing and alert me if it drops 15%: https://articulo.mercadolibre.com.ar/MLA-..."
-- "Show me the price history of that AirPods listing I've been watching"
+- "Find PlayStation 5 in the MercadoLibre Argentina catalog and show the cheapest 5"
+- "Track this product and alert me if it drops 15%: https://www.mercadolibre.com.ar/sony-playstation-5/.../p/MLA63094449"
+- "Show me the price history of that catalog product I've been watching"
 - "What unanswered questions do I have on my listings?"
 - "Which of my listings expire in the next 7 days?"
-- "How does my price for MLA123456789 compare to similar listings?"
+- "List all sellers offering the same product as my listing MLA123456789, sorted by price"
 
 Hermes will load `SKILL.md` automatically when these intents come up.
 

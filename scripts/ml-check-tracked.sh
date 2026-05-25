@@ -1,15 +1,17 @@
 #!/usr/bin/env bash
 # mercadolibre/scripts/ml-check-tracked.sh
 #
-# Walks ~/.hermes/mercadolibre/tracked.json, fetches the current price for each
-# tracked item, appends the snapshot to history, and prints an alert line when
-# the price has dropped by at least the per-item threshold percentage.
+# Walks ~/.hermes/mercadolibre/tracked.json, fetches the current buy-box price
+# for each tracked catalog product, appends the snapshot to history, and prints
+# an ALERT line when the price has dropped by at least the per-product threshold.
 #
-# Cron-friendly: writes alerts to stdout, errors to stderr.
+# Cron-friendly: alerts on stdout, errors on stderr.
 #
-# Pre-requisites: ml_load_token must have been called (or ML_ACCESS_TOKEN is
-# not required for public item lookups). This script uses unauthenticated GET
-# /items/:id which is sufficient for price tracking.
+# Prerequisite: a valid ML_ACCESS_TOKEN in the environment. The /products/ API
+# requires authentication even for reads. Run via:
+#
+#   source ~/.hermes/skills/mercadolibre/scripts/ml-env.sh && ml_load_token && \
+#     bash ~/.hermes/skills/mercadolibre/scripts/ml-check-tracked.sh
 
 set -euo pipefail
 
@@ -25,12 +27,16 @@ ML_API="${ML_API:-https://api.mercadolibre.com}"
 TRACK_DIR="${TRACK_DIR:-$HOME/.hermes/mercadolibre}"
 TRACK_FILE="${TRACK_FILE:-$TRACK_DIR/tracked.json}"
 
+if [ -z "${ML_ACCESS_TOKEN:-}" ]; then
+  echo "ML_ACCESS_TOKEN not set — source scripts/ml-env.sh and call ml_load_token first" >&2
+  exit 1
+fi
+
 if [ ! -f "$TRACK_FILE" ]; then
   echo "No tracked items at $TRACK_FILE" >&2
   exit 0
 fi
 
-# Empty object → nothing to do
 COUNT=$(jq 'length' "$TRACK_FILE")
 [ "$COUNT" -eq 0 ] && exit 0
 
@@ -39,20 +45,19 @@ TMP="${TRACK_FILE}.tmp.$$"
 cp "$TRACK_FILE" "$TMP"
 
 for ID in $(jq -r 'keys[]' "$TMP"); do
-  RESP=$(curl -sS "$ML_API/items/${ID}") || continue
-  CURRENT=$(echo "$RESP" | jq -r '.price // empty')
+  RESP=$(curl -sS -H "Authorization: Bearer $ML_ACCESS_TOKEN" "$ML_API/products/${ID}") || continue
+  CURRENT=$(echo "$RESP" | jq -r '.buy_box_winner.price // empty')
 
-  # Item removed / paused / unavailable
   if [ -z "$CURRENT" ] || [ "$CURRENT" = "null" ]; then
     STATUS=$(echo "$RESP" | jq -r '.status // "unknown"')
     TITLE=$(jq -r --arg id "$ID" '.[$id].title' "$TMP")
-    echo "INFO: $TITLE ($ID) unavailable (status=$STATUS)"
+    echo "INFO: $TITLE ($ID) has no buy-box (status=$STATUS)"
     continue
   fi
 
-  BASELINE=$(jq -r --arg id "$ID" '.[$id].baseline'      "$TMP")
+  BASELINE=$(jq -r --arg id "$ID"  '.[$id].baseline'      "$TMP")
   THRESHOLD=$(jq -r --arg id "$ID" '.[$id].threshold_pct' "$TMP")
-  TITLE=$(jq -r    --arg id "$ID" '.[$id].title'         "$TMP")
+  TITLE=$(jq -r    --arg id "$ID"  '.[$id].title'         "$TMP")
 
   jq --arg id "$ID" --argjson p "$CURRENT" --argjson t "$NOW" \
     '.[$id].history += [{ts:$t, price:$p}] | .[$id].last = $p' \
@@ -60,7 +65,7 @@ for ID in $(jq -r 'keys[]' "$TMP"); do
 
   DROP=$(awk -v b="$BASELINE" -v c="$CURRENT" 'BEGIN{ if (b<=0) print 0; else printf "%.2f", (b-c)/b*100 }')
   if awk -v d="$DROP" -v t="$THRESHOLD" 'BEGIN{ exit !(d >= t) }'; then
-    echo "ALERT $(date -Iseconds)  $TITLE  dropped ${DROP}%  baseline=${BASELINE} now=${CURRENT}  https://mercadolibre.com/p/${ID}"
+    echo "ALERT $(date -Iseconds)  $TITLE  dropped ${DROP}%  baseline=${BASELINE} now=${CURRENT}  https://www.mercadolibre.com.ar/p/${ID}"
   fi
 done
 
