@@ -552,6 +552,57 @@ While the request is pending, the catalog-based recipes in this skill continue t
 - The `read` scope alone is enough for buyer search/price tracking; only request `write` if the user wants to answer questions, edit listings, or modify bookmarks
 - The user can revoke the app at https://www.mercadolibre.com.ar/apps/applications at any time
 
+## Operating as an agent (Hermes / Telegram-driven)
+
+When invoked from a chat interface, the agent should always source the env first and then dispatch to one of the high-level helpers exposed by `ml-env.sh`. These functions are idempotent, return a single human-readable line on stdout, and take care of cron management, file locking, and price-fallback logic so the agent can stay declarative.
+
+```bash
+source ~/.hermes/skills/mercadolibre/scripts/ml-env.sh && ml_load_token
+```
+
+### Intent → command mapping
+
+| User intent (Telegram message) | Helper to call |
+|--------------------------------|----------------|
+| "track this URL" (or paste a `https://...mercadolibre.com.ar/.../p/MLA...` link) | `ml_track_url "<url>" [threshold_pct]` |
+| "track this with X% alert" | `ml_track_url "<url>" X` |
+| "stop tracking MLAxxxxx" / "untrack MLAxxxxx" | `ml_untrack MLAxxxxx` |
+| "what am I tracking?" / "list tracked" | `ml_list_tracked` (returns JSON) |
+| "any alerts?" / "check alerts" | `ml_pending_alerts [seconds]` |
+| "check now" (force a price check) | `bash ~/.hermes/skills/mercadolibre/scripts/ml-check-tracked.sh` |
+| "current price of MLAxxxxx" | `ml_product_price MLAxxxxx` |
+| "search the catalog for X" | `curl -s -H "Authorization: Bearer $ML_ACCESS_TOKEN" "$ML_API/products/search?site_id=$ML_SITE&status=active&q=$(printf %s 'X' \| jq -sRr @uri)&limit=10" \| jq '.results[]\|{id,name,domain_id}'` |
+
+After mutating helpers (`ml_track_url`, `ml_untrack`), relay the helper's stdout to the user verbatim — it's already phrased for human consumption.
+
+### Cron lifecycle
+
+- **First call to `ml_track_url`** installs the cron line (default: every 4 hours) tagged with `# mercadolibre-skill`.
+- **Last call to `ml_untrack`** (when zero items remain) removes that cron line.
+- Manual control: `ml_install_cron "0 */4 * * *"` and `ml_remove_cron`.
+
+The cron job sources `ml-env.sh`, calls `ml_load_token` (auto-refreshing the access token), then runs the checker.
+
+### Delivering alerts to Telegram
+
+**Pull mode (default)** — alerts are appended to `~/.hermes/mercadolibre/alerts.log`. When the user asks "any alerts?" via Telegram, the agent calls `ml_pending_alerts` and replies with the output.
+
+**Push mode (opt-in)** — when the agent has access to the user's Telegram bot credentials, append them to `~/.hermes/.env` so `ml-env.sh` exports them; the checker will then push every new alert directly to the chat via the Telegram Bot API:
+
+```bash
+cat >> ~/.hermes/.env <<'EOF'
+TELEGRAM_BOT_TOKEN=123456789:AAEabcdef...
+TELEGRAM_CHAT_ID=-1001234567890
+EOF
+chmod 600 ~/.hermes/.env
+```
+
+The bot token comes from `@BotFather`; the chat_id can be looked up by sending a message to the bot and reading `https://api.telegram.org/bot<TOKEN>/getUpdates`. Both stay on the user's machine — the skill never transmits them anywhere except Telegram itself.
+
+If the agent doesn't know the bot credentials, leave push mode disabled and stay on pull — it's just as functional, only less proactive.
+
+---
+
 ## Quick reference
 
 | Task | Command |
@@ -560,6 +611,12 @@ While the request is pending, the catalog-based recipes in this skill continue t
 | Install deps | `bash skills/mercadolibre/scripts/install-deps.sh` |
 | Load + refresh token | `source skills/mercadolibre/scripts/ml-env.sh && ml_load_token` |
 | Force refresh | `ml_refresh_token` |
+| Track from URL or ID | `ml_track_url <url\|id> [pct]` |
+| Untrack | `ml_untrack <id>` |
+| List tracked | `ml_list_tracked` |
+| Pending alerts (last 24h) | `ml_pending_alerts [seconds]` |
+| Current price (with fallback) | `ml_product_price <id>` |
+| Install / remove cron | `ml_install_cron` / `ml_remove_cron` |
 | Catalog search | `curl -H "Authorization: Bearer $ML_ACCESS_TOKEN" "$ML_API/products/search?site_id=$ML_SITE&status=active&q=..."` |
 | Product details | `curl -H "Authorization: Bearer $ML_ACCESS_TOKEN" "$ML_API/products/$PRODUCT_ID"` |
 | Sellers offering a product | `curl -H "Authorization: Bearer $ML_ACCESS_TOKEN" "$ML_API/products/$PRODUCT_ID/items"` |
@@ -567,5 +624,4 @@ While the request is pending, the catalog-based recipes in this skill continue t
 | My active listings | `curl -H "Authorization: Bearer $ML_ACCESS_TOKEN" "$ML_API/users/$ML_USER_ID/items/search?status=active"` |
 | Unanswered questions | `curl -H "Authorization: Bearer $ML_ACCESS_TOKEN" "$ML_API/my/received_questions/search?status=UNANSWERED"` |
 | Answer a question | `POST $ML_API/answers` with `{question_id, text}` |
-| Track product locally | append entry to `~/.hermes/mercadolibre/tracked.json` |
 | Check tracked + alert | `bash skills/mercadolibre/scripts/ml-check-tracked.sh` |

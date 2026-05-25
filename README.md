@@ -61,11 +61,14 @@ Supported: `apt`, `dnf`, `yum`, `apk`, `pacman`, `zypper`, `brew`. If your syste
 Once configured, ask Hermes things like:
 
 - "Find PlayStation 5 in the MercadoLibre Argentina catalog and show the cheapest 5"
-- "Track this product and alert me if it drops 15%: https://www.mercadolibre.com.ar/sony-playstation-5/.../p/MLA63094449"
-- "Show me the price history of that catalog product I've been watching"
+- "Track this product, alert me at 15%: https://www.mercadolibre.com.ar/sony-playstation-5/.../p/MLA63094449"
+- "What am I tracking?"
+- "Any alerts in the last 12 hours?"
+- "Stop tracking MLA63094449"
 - "What unanswered questions do I have on my listings?"
-- "Which of my listings expire in the next 7 days?"
 - "List all sellers offering the same product as my listing MLA123456789, sorted by price"
+
+The skill installs/removes its own cron job as you add or remove tracked items, so price polling stays alive without manual setup. If you want alert messages to arrive proactively in Telegram instead of waiting for "any alerts?", add `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` to `~/.hermes/.env` (see `.env.example`).
 
 Hermes will load `SKILL.md` automatically when these intents come up.
 

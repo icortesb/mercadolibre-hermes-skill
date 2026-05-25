@@ -27,6 +27,19 @@ ML_API="${ML_API:-https://api.mercadolibre.com}"
 TRACK_DIR="${TRACK_DIR:-$HOME/.hermes/mercadolibre}"
 TRACK_FILE="${TRACK_FILE:-$TRACK_DIR/tracked.json}"
 
+# Optional Telegram push. If both vars are present in the env (e.g. exported by
+# ml-env.sh after sourcing ~/.hermes/.env), each ALERT line is also pushed
+# directly via the Telegram Bot API. Leave unset to keep alerts in the log only.
+_ml_telegram_push() {
+  local msg="$1"
+  [ -n "${TELEGRAM_BOT_TOKEN:-}" ] && [ -n "${TELEGRAM_CHAT_ID:-}" ] || return 0
+  curl -sS -o /dev/null \
+    "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+    --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" \
+    --data-urlencode "text=${msg}" \
+    --data-urlencode "disable_web_page_preview=true" || true
+}
+
 if [ -z "${ML_ACCESS_TOKEN:-}" ]; then
   echo "ML_ACCESS_TOKEN not set — source scripts/ml-env.sh and call ml_load_token first" >&2
   exit 1
@@ -71,7 +84,10 @@ for ID in $(jq -r 'keys[]' "$TMP"); do
 
   DROP=$(awk -v b="$BASELINE" -v c="$CURRENT" 'BEGIN{ if (b<=0) print 0; else printf "%.2f", (b-c)/b*100 }')
   if awk -v d="$DROP" -v t="$THRESHOLD" 'BEGIN{ exit !(d >= t) }'; then
-    echo "ALERT $(date -Iseconds)  $TITLE  dropped ${DROP}%  baseline=${BASELINE} now=${CURRENT}  https://www.mercadolibre.com.ar/p/${ID}"
+    ALERT_LINE="ALERT $(date -Iseconds)  $TITLE  dropped ${DROP}%  baseline=${BASELINE} now=${CURRENT}  https://www.mercadolibre.com.ar/p/${ID}"
+    echo "$ALERT_LINE"
+    _ml_telegram_push "🔻 $TITLE dropped ${DROP}% — was ${BASELINE}, now ${CURRENT}
+https://www.mercadolibre.com.ar/p/${ID}"
   fi
 done
 

@@ -131,6 +131,131 @@ ml_product_price() {
   [ -n "$price" ] && printf '%s' "$price"
 }
 
+# =====================================================================
+# Agent-mode helpers: high-level operations Hermes invokes from chat
+# =====================================================================
+#
+# Each function returns 0 on success, non-zero on failure, and prints a
+# single human-friendly line on stdout (or the requested data structure)
+# so the agent can relay it verbatim to the user.
+
+ML_TRACK_FILE="${ML_TRACK_FILE:-$HOME/.hermes/mercadolibre/tracked.json}"
+ML_ALERTS_LOG="${ML_ALERTS_LOG:-$HOME/.hermes/mercadolibre/alerts.log}"
+ML_CRON_TAG="# mercadolibre-skill"
+
+_ml_ensure_track_file() {
+  mkdir -p "$(dirname "$ML_TRACK_FILE")"
+  [ -f "$ML_TRACK_FILE" ] || echo '{}' > "$ML_TRACK_FILE"
+}
+
+# Extract a MercadoLibre product ID (e.g. MLA63094449) from a website URL.
+# Echoes the ID or returns 1 if not found.
+ml_url_to_product_id() {
+  local url="$1" id
+  id=$(printf %s "$url" | grep -oE '/p/(MLA|MLB|MLM|MLC|MCO|MLU)[0-9]+' | head -1 | sed 's|/p/||')
+  [ -n "$id" ] || return 1
+  printf %s "$id"
+}
+
+# Install the periodic checker cron job. Idempotent — leaves the crontab alone
+# if our tag is already present. Default interval: every 4 hours.
+ml_install_cron() {
+  local interval="${1:-0 */4 * * *}"
+  if crontab -l 2>/dev/null | grep -qF "$ML_CRON_TAG"; then
+    echo "cron already installed"
+    return 0
+  fi
+  local line="$interval source \$HOME/.hermes/skills/mercadolibre/scripts/ml-env.sh && ml_load_token && bash \$HOME/.hermes/skills/mercadolibre/scripts/ml-check-tracked.sh >> $ML_ALERTS_LOG 2>&1 $ML_CRON_TAG"
+  ( crontab -l 2>/dev/null; echo "$line" ) | crontab -
+  echo "cron installed ($interval)"
+}
+
+# Remove our cron line.
+ml_remove_cron() {
+  if ! crontab -l 2>/dev/null | grep -qF "$ML_CRON_TAG"; then
+    echo "no cron to remove"
+    return 0
+  fi
+  crontab -l 2>/dev/null | grep -vF "$ML_CRON_TAG" | crontab -
+  echo "cron removed"
+}
+
+# Track a product by its MercadoLibre website URL or product_id.
+#   ml_track_url <URL_or_PRODUCT_ID> [threshold_pct]
+# threshold_pct defaults to 10. Installs the cron automatically if first item.
+ml_track_url() {
+  local input="$1" threshold="${2:-10}" pid title price now
+  [ -n "$input" ] || { echo "ml_track_url: pass a URL or product_id" >&2; return 1; }
+
+  if printf %s "$input" | grep -qE '^(MLA|MLB|MLM|MLC|MCO|MLU)[0-9]+$'; then
+    pid="$input"
+  else
+    pid=$(ml_url_to_product_id "$input") || { echo "ml_track_url: no /p/MLA... in URL" >&2; return 1; }
+  fi
+
+  ml_load_token || return 1
+  _ml_ensure_track_file
+
+  title=$(curl -sS -H "Authorization: Bearer $ML_ACCESS_TOKEN" "$ML_API/products/$pid" | jq -r '.name // empty')
+  [ -n "$title" ] || { echo "ml_track_url: product $pid not found" >&2; return 1; }
+
+  price=$(ml_product_price "$pid")
+  [ -n "$price" ] || { echo "ml_track_url: no active offers for $pid" >&2; return 1; }
+
+  now=$(date +%s)
+  jq --arg id "$pid" --arg t "$title" --argjson p "$price" --argjson pct "$threshold" --argjson ts "$now" \
+    '.[$id] = {title:$t, baseline:$p, last:$p, threshold_pct:$pct, history:[{ts:$ts, price:$p}]}' \
+    "$ML_TRACK_FILE" > "$ML_TRACK_FILE.tmp" && \mv -f "$ML_TRACK_FILE.tmp" "$ML_TRACK_FILE"
+
+  ml_install_cron >/dev/null
+  echo "Tracking '$title' ($pid) @ $price — alert if drops ≥${threshold}%"
+}
+
+# Untrack a product. Removes the cron if this was the last item.
+#   ml_untrack <PRODUCT_ID>
+ml_untrack() {
+  local pid="$1"
+  [ -n "$pid" ] || { echo "ml_untrack: pass a product_id" >&2; return 1; }
+  [ -f "$ML_TRACK_FILE" ] || { echo "nothing tracked"; return 0; }
+
+  local existed
+  existed=$(jq -r --arg id "$pid" 'has($id) | tostring' "$ML_TRACK_FILE")
+  [ "$existed" = "true" ] || { echo "$pid was not tracked"; return 0; }
+
+  jq --arg id "$pid" 'del(.[$id])' "$ML_TRACK_FILE" > "$ML_TRACK_FILE.tmp" && \mv -f "$ML_TRACK_FILE.tmp" "$ML_TRACK_FILE"
+
+  if [ "$(jq 'length' "$ML_TRACK_FILE")" = "0" ]; then
+    ml_remove_cron >/dev/null
+    echo "Untracked $pid (was the last one — cron removed)"
+  else
+    echo "Untracked $pid"
+  fi
+}
+
+# List currently tracked products as compact JSON.
+ml_list_tracked() {
+  [ -f "$ML_TRACK_FILE" ] || { echo '[]'; return 0; }
+  jq 'to_entries | map({id:.key, title:.value.title, baseline:.value.baseline, last:.value.last, threshold_pct:.value.threshold_pct, drop_pct: (if .value.baseline > 0 then ((.value.baseline - .value.last) / .value.baseline * 100 | floor) else 0 end)})' "$ML_TRACK_FILE"
+}
+
+# Print recent ALERT lines from the log. Default window: 24 hours.
+#   ml_pending_alerts [seconds]
+ml_pending_alerts() {
+  local since="${1:-86400}"
+  [ -f "$ML_ALERTS_LOG" ] || { echo "no alerts yet"; return 0; }
+  local cutoff
+  cutoff=$(date -u -d "-${since} seconds" +%s 2>/dev/null || date -u -v -${since}S +%s 2>/dev/null) || cutoff=0
+
+  awk -v cutoff="$cutoff" '
+    /^ALERT / {
+      cmd = "date -d \"" $2 "\" +%s 2>/dev/null"
+      cmd | getline ts
+      close(cmd)
+      if (ts == "" || ts >= cutoff) print
+    }
+  ' "$ML_ALERTS_LOG"
+}
+
 # Authenticated curl with retry on 401 (auto-refresh) and 429/5xx (exponential backoff).
 # Usage: ml_curl <url> [extra curl args]
 ml_curl() {
