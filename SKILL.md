@@ -564,16 +564,40 @@ source ~/.hermes/skills/mercadolibre/scripts/ml-env.sh && ml_load_token
 
 | User intent (Telegram message) | Helper to call |
 |--------------------------------|----------------|
-| "track this URL" (or paste a `https://...mercadolibre.com.ar/.../p/MLA...` link) | `ml_track_url "<url>" [threshold_pct]` |
-| "track this with X% alert" | `ml_track_url "<url>" X` |
+| "I'm thinking of buying a [product]" / "looking for X" / casual mention | `ml_search "X"` → present results → wait for pick |
+| "search for X" / "show me X" | `ml_search "X" [limit]` |
+| "track this URL" / paste a `https://...mercadolibre.com.ar/.../p/MLA...` link | `ml_track_url "<url>" [threshold_pct]` |
+| "track number 2" / "track the cheapest" (after a search) | `ml_track_url <id_from_search> [threshold_pct]` |
 | "stop tracking MLAxxxxx" / "untrack MLAxxxxx" | `ml_untrack MLAxxxxx` |
-| "what am I tracking?" / "list tracked" | `ml_list_tracked` (returns JSON) |
+| "what am I tracking?" / "list tracked" | `ml_list_tracked` |
 | "any alerts?" / "check alerts" | `ml_pending_alerts [seconds]` |
-| "check now" (force a price check) | `bash ~/.hermes/skills/mercadolibre/scripts/ml-check-tracked.sh` |
+| "check now" / "refresh prices" | `bash ~/.hermes/skills/mercadolibre/scripts/ml-check-tracked.sh` |
 | "current price of MLAxxxxx" | `ml_product_price MLAxxxxx` |
-| "search the catalog for X" | `curl -s -H "Authorization: Bearer $ML_ACCESS_TOKEN" "$ML_API/products/search?site_id=$ML_SITE&status=active&q=$(printf %s 'X' \| jq -sRr @uri)&limit=10" \| jq '.results[]\|{id,name,domain_id}'` |
 
 After mutating helpers (`ml_track_url`, `ml_untrack`), relay the helper's stdout to the user verbatim — it's already phrased for human consumption.
+
+### Conversational search-then-track flow
+
+When the user mentions a product casually ("estoy por comprar una PS5", "looking for AirPods Pro", "necesito una notebook gamer") **do not assume they want to track immediately**. Instead:
+
+1. Call `ml_search "<their product>"` and parse the JSON.
+2. Present the top results in a Telegram-friendly format with a numeric index:
+
+   ```
+   1. Sony Playstation 5 consola Slim Digital + Astro Bot + GT7  —  $990.000
+      ID: MLA63094449
+   2. Sony Playstation 5 consola Slim Digital  —  $1.050.000
+      ID: MLA60875568
+   3. ...
+   ```
+
+3. Ask a follow-up: "Querés que trackee alguno? Decime el número, el ID, o si querés que busque otra cosa."
+4. On the next turn, if the user picks one ("trackeá el 1", "el más barato", "trackeá MLA63094449 al 10%"), call `ml_track_url <id> [pct]` with the chosen ID and the threshold (default 10%).
+5. If the user wants to refine ("busca el modelo Pro", "muestra usados") → call `ml_search` again with the refined query.
+
+Always **echo prices using the user's locale** (in the example above, AR pesos with `.` as thousands separator). The skill returns raw integers — you do the formatting.
+
+If the user pastes a MercadoLibre URL instead of describing a product, skip the search step and go directly to `ml_track_url "<url>"`.
 
 ### Cron lifecycle
 
@@ -611,6 +635,7 @@ If the agent doesn't know the bot credentials, leave push mode disabled and stay
 | Install deps | `bash skills/mercadolibre/scripts/install-deps.sh` |
 | Load + refresh token | `source skills/mercadolibre/scripts/ml-env.sh && ml_load_token` |
 | Force refresh | `ml_refresh_token` |
+| Catalog search (chat-ready) | `ml_search "<query>" [limit]` |
 | Track from URL or ID | `ml_track_url <url\|id> [pct]` |
 | Untrack | `ml_untrack <id>` |
 | List tracked | `ml_list_tracked` |

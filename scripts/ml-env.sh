@@ -238,6 +238,40 @@ ml_list_tracked() {
   jq 'to_entries | map({id:.key, title:.value.title, baseline:.value.baseline, last:.value.last, threshold_pct:.value.threshold_pct, drop_pct: (if .value.baseline > 0 then ((.value.baseline - .value.last) / .value.baseline * 100 | floor) else 0 end)})' "$ML_TRACK_FILE"
 }
 
+# Search the MercadoLibre catalog and return a compact JSON list of products
+# with their current price (buy_box if available, else min(offers)). Designed
+# to be relayed to the user in chat so they can pick one to track.
+#   ml_search "query"      → top 5 results
+#   ml_search "query" 10   → top N results (max 50)
+ml_search() {
+  local query="$1" limit="${2:-5}" site="${ML_SITE:-MLA}"
+  [ -n "$query" ] || { echo "ml_search: pass a query" >&2; return 1; }
+  ml_load_token || return 1
+
+  local q ids out='[]' info name buybox price
+  q=$(printf %s "$query" | jq -sRr @uri)
+  ids=$(curl -sS -H "Authorization: Bearer $ML_ACCESS_TOKEN" \
+    "$ML_API/products/search?site_id=${site}&status=active&q=${q}&limit=${limit}" \
+    | jq -r '.results[].id')
+
+  [ -n "$ids" ] || { echo '[]'; return 0; }
+
+  for id in $ids; do
+    info=$(curl -sS -H "Authorization: Bearer $ML_ACCESS_TOKEN" "$ML_API/products/$id")
+    name=$(echo "$info" | jq -r '.name // empty')
+    buybox=$(echo "$info" | jq -r '.buy_box_winner.price // empty')
+    if [ -n "$buybox" ]; then
+      price="$buybox"
+    else
+      price=$(curl -sS -H "Authorization: Bearer $ML_ACCESS_TOKEN" "$ML_API/products/$id/items?limit=50" \
+        | jq -r '[.results[].price | select(. != null)] | if length == 0 then empty else min end')
+    fi
+    out=$(printf '%s' "$out" | jq --arg id "$id" --arg name "$name" --argjson price "${price:-null}" \
+      '. + [{id:$id, name:$name, price:$price}]')
+  done
+  printf '%s' "$out"
+}
+
 # Print recent ALERT lines from the log. Default window: 24 hours.
 #   ml_pending_alerts [seconds]
 ml_pending_alerts() {

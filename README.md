@@ -1,29 +1,100 @@
 # mercadolibre — Hermes Agent skill
 
-Integrate MercadoLibre into Hermes so the agent can act as a **buyer** (catalog search, product price tracking with drop alerts, price history) and as a **seller** (active-listings overview, unanswered questions, competitor price comparison via catalog offers, expiration alerts).
+Turn Hermes into a MercadoLibre shopping assistant and seller-side monitor. Drive everything from chat (Telegram, CLI, web — wherever Hermes is exposed): search the catalog, snapshot product prices, get drop alerts, manage your listings.
 
-Covers MercadoLibre Argentina, Brazil, Mexico, Chile, Colombia, and Uruguay (any site that uses the API at `https://api.mercadolibre.com`).
+Built on the official REST API at `https://api.mercadolibre.com`. Works on a freshly-created MercadoLibre app — buyer flows use the catalog/product endpoints (`/products/*`) which don't require app validation.
 
-Buyer flows are built on the **catalog/product API** (`/products/*`), which works on any authenticated app — no MercadoLibre app-validation step required for typical price-tracking and shopping use cases. See `SKILL.md` → "App validation" if you also need item-level (`/items/{id}`) or keyword-search access.
+Supports MercadoLibre Argentina, Brazil, Mexico, Chile, Colombia, and Uruguay.
+
+---
+
+## Table of contents
+
+- [What it does](#what-it-does)
+- [How it works](#how-it-works)
+- [Install](#install)
+- [Configure](#configure)
+- [Use from chat](#use-from-chat)
+- [Use from the shell](#use-from-the-shell)
+- [Telegram push (optional)](#telegram-push-optional)
+- [Files & layout](#files--layout)
+- [Dependencies](#dependencies)
+- [Troubleshooting](#troubleshooting)
+- [License](#license)
+
+---
+
+## What it does
+
+**Buyer-side (no app validation needed)**
+
+- Search the catalog by free-text query, return top N products with current prices
+- Look up any catalog product by ID (or by parsing a MercadoLibre URL)
+- Snapshot product prices locally, build a price history
+- Alert when a tracked product drops by a configurable percentage (default 10%)
+- List all active offers for a catalog product (price comparison across sellers)
+
+**Seller-side (uses your own listings)**
+
+- Summary of your active listings (visits, sold quantity, unanswered questions, expiration)
+- List unanswered customer questions; answer them
+- Compare your listing's price against other sellers of the same catalog product
+- Find listings that expire within N days
+
+**Authentication**
+
+- One-shot OAuth2 flow stored in `~/.hermes/.env`
+- Automatic access-token refresh (tokens last 6 hours; refresh tokens rotate on every use and are persisted atomically)
+- Pre-flight dependency check for `curl` and `jq` with an auto-installer
+
+**Operational**
+
+- Self-managed cron: the periodic price-checker is installed when you track your first item and removed when you untrack the last one
+- Optional direct Telegram push of alerts (in addition to the local alert log)
+
+---
+
+## How it works
+
+```
+┌────────────────────┐          ┌────────────────────────┐
+│   You (Telegram)   │  chat    │      Hermes Agent      │
+│                    │ ───────▶ │  (reads SKILL.md, runs │
+└────────────────────┘          │   ml_* helpers)        │
+                                └─────────┬──────────────┘
+                                          │  bash/curl
+                                          ▼
+                ┌───────────────────────────────────────────┐
+                │  ~/.hermes/skills/mercadolibre/scripts/   │
+                │   ├─ ml-env.sh        (sourced helpers)   │
+                │   ├─ ml-oauth.sh      (one-shot setup)    │
+                │   ├─ ml-check-tracked.sh  (cron target)   │
+                │   └─ install-deps.sh                      │
+                └─────────────────────┬─────────────────────┘
+                                      │  HTTPS + OAuth2
+                                      ▼
+                          ┌─────────────────────────┐
+                          │  api.mercadolibre.com   │
+                          └─────────────────────────┘
+                                      │
+                  cron every 4h ──────┘
+                  writes ALERTs to ~/.hermes/mercadolibre/alerts.log
+                  (and pushes to Telegram if configured)
+```
+
+The agent never needs to call MercadoLibre directly — it only calls the helper functions in `ml-env.sh`, which take care of authentication, retries, token refresh, price-fallback for multi-variant products, and crontab management.
+
+---
 
 ## Install
 
-Copy the folder into your Hermes skills directory:
+Clone the skill into Hermes's skills directory on the host that runs the agent (typically a server / VPS):
 
 ```bash
-cp -r mercadolibre ~/.hermes/skills/
-```
-
-Or symlink it during development:
-
-```bash
-ln -s "$(pwd)/mercadolibre" ~/.hermes/skills/mercadolibre
-```
-
-Make the helper scripts executable:
-
-```bash
-chmod +x ~/.hermes/skills/mercadolibre/scripts/*.sh
+mkdir -p ~/.hermes/skills
+cd ~/.hermes/skills
+git clone https://github.com/icortesb/mercadolibre-hermes-skill mercadolibre
+chmod +x mercadolibre/scripts/*.sh
 ```
 
 Install runtime dependencies (`curl`, `jq`) — the bundled helper auto-detects your package manager:
@@ -32,96 +103,193 @@ Install runtime dependencies (`curl`, `jq`) — the bundled helper auto-detects 
 bash ~/.hermes/skills/mercadolibre/scripts/install-deps.sh
 ```
 
-Supported: `apt`, `dnf`, `yum`, `apk`, `pacman`, `zypper`, `brew`. If your system isn't covered, install `curl` and `jq` manually before continuing.
+Supported package managers: `apt`, `dnf`, `yum`, `apk`, `pacman`, `zypper`, `brew`. If your system isn't covered (or installation is blocked by inotify/fd limits on a small VPS), install `curl` and `jq` manually — e.g. for `jq` you can download a static binary from https://jqlang.github.io/jq/download/.
+
+---
 
 ## Configure
 
-1. Create an app at https://developers.mercadolibre.com.ar/devcenter
-   - Pick any name (e.g. `hermes-agent`)
-   - Redirect URI: `https://localhost:8080/callback` (any valid HTTPS URL works — no server needed)
-   - Scopes: `read`, `write`, `offline_access`
-2. Copy the App ID and Secret Key into `~/.hermes/.env`:
+### 1. Create a MercadoLibre app
 
-   ```bash
-   cp .env.example ~/.hermes/.env
-   chmod 600 ~/.hermes/.env
-   $EDITOR ~/.hermes/.env       # paste your App ID + Secret + pick ML_SITE
-   ```
+1. Sign in at https://developers.mercadolibre.com.ar/devcenter
+2. Click **Create new application**
+3. Settings:
+   - **Name**: anything (e.g. `hermes-agent`)
+   - **Redirect URI**: any valid HTTPS URL — `https://www.google.com` works fine. MercadoLibre rejects `https://localhost:*` for security; the URL just needs to be syntactically valid. No server is required at that URL; the skill reads the `?code=` parameter from the redirected URL bar after authorization.
+   - **Scopes**: `read`, `write`, `offline_access`
+4. Save and copy the **App ID** and **Secret Key**
 
-3. Run the one-shot OAuth helper to authorize the app and persist tokens:
+### 2. Drop credentials into `~/.hermes/.env`
 
-   ```bash
-   bash ~/.hermes/skills/mercadolibre/scripts/ml-oauth.sh
-   ```
+```bash
+cp ~/.hermes/skills/mercadolibre/.env.example ~/.hermes/.env
+chmod 600 ~/.hermes/.env
+$EDITOR ~/.hermes/.env       # paste App ID, Secret, set ML_SITE, set ML_REDIRECT_URI to match the app
+```
 
-   The script prints an authorization URL, asks the user to open it in a browser, then paste back the redirected URL. It extracts the `code`, exchanges it for tokens, and writes everything to `~/.hermes/.env`.
+If `$EDITOR` complains about your terminal (common when SSH'ing from kitty/wezterm), either run `TERM=xterm nano ...` or write the file from the shell:
 
-## Use
+```bash
+echo "ML_CLIENT_ID=YOUR_APP_ID"             > ~/.hermes/.env
+echo "ML_CLIENT_SECRET=YOUR_SECRET"        >> ~/.hermes/.env
+echo "ML_REDIRECT_URI=https://www.google.com" >> ~/.hermes/.env
+echo "ML_SITE=MLA"                         >> ~/.hermes/.env
+chmod 600 ~/.hermes/.env
+```
 
-Once configured, ask Hermes things like:
+### 3. Run the OAuth flow
 
-- "Find PlayStation 5 in the MercadoLibre Argentina catalog and show the cheapest 5"
-- "Track this product, alert me at 15%: https://www.mercadolibre.com.ar/sony-playstation-5/.../p/MLA63094449"
-- "What am I tracking?"
-- "Any alerts in the last 12 hours?"
-- "Stop tracking MLA63094449"
-- "What unanswered questions do I have on my listings?"
-- "List all sellers offering the same product as my listing MLA123456789, sorted by price"
+```bash
+bash ~/.hermes/skills/mercadolibre/scripts/ml-oauth.sh
+```
 
-The skill installs/removes its own cron job as you add or remove tracked items, so price polling stays alive without manual setup. If you want alert messages to arrive proactively in Telegram instead of waiting for "any alerts?", add `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHAT_ID` to `~/.hermes/.env` (see `.env.example`).
+The script:
+1. Prompts for App ID, Secret, Redirect URI, and Site (Enter to accept defaults from `.env`)
+2. Prints a long authorization URL — open it in any browser, sign in, click **Authorize**
+3. Your browser redirects to the redirect URI with `?code=...` in the address bar (the page itself will fail to load — that's expected)
+4. Paste the entire redirected URL back into the prompt
+5. The script exchanges the code for an access token + refresh token, writes them to `~/.hermes/.env`
 
-Hermes will load `SKILL.md` automatically when these intents come up.
+You only do this once. After that, the helper auto-refreshes whenever the 6-hour access token expires.
 
-## Files
+---
 
-| File | Purpose |
-|------|---------|
-| `SKILL.md` | Agent-facing instructions (Hermes loads this) |
-| `README.md` | This file — install & configure for humans |
-| `.env.example` | Config template, copy to `~/.hermes/.env` |
-| `scripts/ml-env.sh` | Source-able token loader + auto-refresh |
-| `scripts/ml-oauth.sh` | Interactive first-time OAuth flow |
-| `scripts/ml-check-tracked.sh` | Cron-friendly tracked-items checker (alerts on price drops) |
-| `scripts/install-deps.sh` | Auto-detect package manager and install `curl` + `jq` |
+## Use from chat
 
-Tracking state is stored at `~/.hermes/mercadolibre/tracked.json`.
+Hermes loads `SKILL.md` whenever the user mentions MercadoLibre, prices, listings, or anything matching the skill's description. From Telegram (or any Hermes interface) you can say things like:
+
+| You say | What Hermes does |
+|---------|------------------|
+| "I'm thinking of buying a PS5" | `ml_search "PS5"`, presents top 5 with prices, asks which to track |
+| "Track the cheapest" / "Track #2" / "Track MLA63094449" | `ml_track_url <id>` with the chosen ID |
+| "Track this with a 5% alert: https://www.mercadolibre.com.ar/.../p/MLA63094449" | `ml_track_url "<url>" 5` |
+| "What am I tracking?" | `ml_list_tracked` |
+| "Any alerts in the last 12 hours?" | `ml_pending_alerts 43200` |
+| "Stop tracking MLA63094449" | `ml_untrack MLA63094449` |
+| "What's the current price of MLA63094449?" | `ml_product_price MLA63094449` |
+| "Search the catalog for AirPods Pro" | `ml_search "AirPods Pro" 10` |
+| "List sellers offering MLA63094449" | `curl /products/MLA63094449/items` |
+| "What unanswered questions do I have?" | `curl /my/received_questions/search?status=UNANSWERED` |
+| "Which of my listings expire this week?" | walk `/users/$ML_USER_ID/items/search?status=active` and filter by `stop_time` |
+
+The first call to `ml_track_url` installs a cron job that checks tracked products every 4 hours. The cron is removed automatically when you untrack the last item.
+
+---
+
+## Use from the shell
+
+Sometimes useful for testing or scripting outside Hermes:
+
+```bash
+source ~/.hermes/skills/mercadolibre/scripts/ml-env.sh
+ml_load_token
+
+# Search
+ml_search "iphone 16 pro" 5
+
+# Track (from URL or product ID)
+ml_track_url "https://www.mercadolibre.com.ar/.../p/MLA63094449" 10
+ml_track_url MLA63094449 10
+
+# Inspect
+ml_list_tracked
+ml_product_price MLA63094449
+
+# Manual price check (would normally run via cron)
+bash ~/.hermes/skills/mercadolibre/scripts/ml-check-tracked.sh
+
+# Untrack
+ml_untrack MLA63094449
+
+# Recent alerts
+ml_pending_alerts                # last 24h
+ml_pending_alerts 3600           # last hour
+```
+
+For arbitrary API calls, use the authenticated `ml_curl` wrapper (handles 401 refresh and 429 backoff automatically):
+
+```bash
+ml_curl "$ML_API/users/me" | jq
+ml_curl "$ML_API/products/search?site_id=$ML_SITE&q=playstation%205&limit=3" | jq '.results[] | {id, name}'
+```
+
+---
+
+## Telegram push (optional)
+
+By default, alerts land in `~/.hermes/mercadolibre/alerts.log` and the agent surfaces them when you ask "any alerts?". To get push notifications instead, append two extra lines to `~/.hermes/.env`:
+
+```bash
+echo 'TELEGRAM_BOT_TOKEN=123456789:AAEabcdef...'  >> ~/.hermes/.env
+echo 'TELEGRAM_CHAT_ID=-1001234567890'            >> ~/.hermes/.env
+```
+
+How to get those:
+
+- **Bot token**: open `@BotFather` in Telegram → `/newbot` → follow the prompts → copy the token it gives you. If you already have a bot, `/mybots` → pick it → API token.
+- **Chat ID**: send any message to the bot, then visit `https://api.telegram.org/bot<TOKEN>/getUpdates` in your browser. Look for `"chat":{"id": ...}`. For private chats it's a positive number; for groups, a negative one starting with `-100`.
+
+Once both are set, every alert is pushed to the chat in addition to being logged. Nothing else changes — pull-mode commands (`ml_pending_alerts`) keep working.
+
+---
+
+## Files & layout
+
+```
+mercadolibre/
+├── SKILL.md                       # Agent-facing instructions (Hermes loads this)
+├── README.md                      # This file
+├── .env.example                   # Config template
+└── scripts/
+    ├── ml-env.sh                  # Sourced — exposes ml_* helper functions
+    ├── ml-oauth.sh                # One-shot interactive OAuth2 flow
+    ├── ml-check-tracked.sh        # Periodic price checker (cron target)
+    └── install-deps.sh            # Auto-detect package manager, install curl + jq
+```
+
+State files (created at runtime, never committed):
+
+```
+~/.hermes/
+├── .env                           # OAuth credentials + tokens (chmod 600)
+└── mercadolibre/
+    ├── tracked.json               # Tracked products + price history
+    └── alerts.log                 # Append-only ALERT lines
+```
+
+Crontab entries are tagged with `# mercadolibre-skill` and managed by `ml_install_cron` / `ml_remove_cron`.
+
+---
 
 ## Dependencies
 
-- `curl` — required
-- `jq`   — required, parses every API response
-- `bash` 4+ (for `ml-oauth.sh`'s associative array of auth hosts)
-- GNU `date` on Linux or BSD `date` on macOS — both supported
+- `bash` 4+
+- `curl`
+- `jq`
+- GNU `date` (Linux) or BSD `date` (macOS) — both supported
 
-## Automation (optional)
+Everything else is plain POSIX shell tooling.
 
-Add to crontab to get periodic alerts:
-
-```cron
-# Check tracked items for price drops every 4 hours
-0 */4 * * * source $HOME/.hermes/skills/mercadolibre/scripts/ml-env.sh && ml_load_token && \
-  bash $HOME/.hermes/skills/mercadolibre/scripts/ml-check-tracked.sh \
-  >> $HOME/.hermes/mercadolibre/alerts.log 2>&1
-
-# Notify when seller has unanswered questions (9am–9pm)
-0 9-21 * * * source $HOME/.hermes/skills/mercadolibre/scripts/ml-env.sh && ml_load_token && \
-  COUNT=$(curl -s -H "Authorization: Bearer $ML_ACCESS_TOKEN" \
-    "$ML_API/my/received_questions/search?status=UNANSWERED" | jq -r '.total // 0') && \
-  [ "$COUNT" -gt 0 ] && notify-send "MercadoLibre" "$COUNT unanswered question(s)"
-```
+---
 
 ## Troubleshooting
 
-| Symptom | Likely cause | Fix |
-|---------|--------------|-----|
-| `400 invalid_grant` on refresh | refresh_token was rotated and not persisted | Re-run `ml-oauth.sh` |
-| `400 invalid_client` | wrong client_id or secret | Check `~/.hermes/.env` |
-| `401 invalid_token` after refresh | clock skew, or stale `ML_EXPIRES_AT` | `ml_refresh_token` once, retry |
-| `403 forbidden` on POST/PUT | app missing `write` scope | Re-authorize with proper scopes |
-| `429 too_many_requests` | rate limited (~1000 req/h) | Exponential backoff; see `ml_curl` in SKILL.md |
-| `404 not_found` on item | wrong `ML_SITE`, or item removed | Verify ID and site code |
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| `400 invalid_grant` on refresh | Refresh token was rotated and not persisted (e.g., two refreshes raced) | Re-run `ml-oauth.sh` |
+| `400 invalid_client` | Wrong client_id or secret in `.env` | Re-check; rotate secret if leaked |
+| `401 invalid_token` after refresh | Clock skew, or stale `ML_EXPIRES_AT` | `ml_refresh_token` once, retry |
+| `403 forbidden` on POST/PUT | App missing `write` scope | Re-authorize the app with all three scopes |
+| `403 access_denied` on `/items/{id}` or `/sites/.../search` | App not validated for catalog-wide access | Use the `/products/*` endpoints (the skill already does), or request validation in the devcenter |
+| `404 not_found` on an item | Wrong `ML_SITE`, or the item was removed | Verify ID and site code |
+| `429 too_many_requests` | Rate limited (~1000 req/h per user) | `ml_curl` retries with exponential backoff — wait it out |
+| `Failed to allocate directory watch: Too many open files` (apt install) | Tiny VPS hit the inotify limit | `sysctl -w fs.inotify.max_user_watches=524288`, or install jq via the static binary |
+| `mv: overwrite '...'?` prompt on the helpers | Interactive shell has `mv` aliased to `mv -i` | Already mitigated — helpers use `\mv -f` to bypass aliases |
+| `Lo sentimos, la aplicación no puede conectarse a tu cuenta` during OAuth | Redirect URI mismatch between the app config and `.env` | Make both identical; MercadoLibre is strict about trailing slashes |
 
 To revoke the app entirely: https://www.mercadolibre.com.ar/apps/applications
+
+---
 
 ## License
 
