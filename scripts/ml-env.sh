@@ -125,7 +125,7 @@ ml_product_price() {
   if [ -z "$price" ]; then
     # Fall back to min price across active offers
     price=$(curl -sS -H "Authorization: Bearer $ML_ACCESS_TOKEN" "$ML_API/products/${product_id}/items?limit=50" \
-      | jq -r '[.results[].price | select(. != null)] | if length == 0 then empty else min end')
+      | jq -r '[.results // [] | .[].price | select(. != null)] | if length == 0 then empty else min end')
   fi
 
   [ -n "$price" ] && printf '%s' "$price"
@@ -264,7 +264,7 @@ ml_search() {
       price="$buybox"
     else
       price=$(curl -sS -H "Authorization: Bearer $ML_ACCESS_TOKEN" "$ML_API/products/$id/items?limit=50" \
-        | jq -r '[.results[].price | select(. != null)] | if length == 0 then empty else min end')
+        | jq -r '[.results // [] | .[].price | select(. != null)] | if length == 0 then empty else min end')
     fi
     out=$(printf '%s' "$out" | jq --arg id "$id" --arg name "$name" --argjson price "${price:-null}" \
       '. + [{id:$id, name:$name, price:$price}]')

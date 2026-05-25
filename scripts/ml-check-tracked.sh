@@ -64,7 +64,7 @@ for ID in $(jq -r 'keys[]' "$TMP"); do
   # Fall back to min offer price if the product has pickers/variants (buy_box null)
   if [ -z "$CURRENT" ] || [ "$CURRENT" = "null" ]; then
     CURRENT=$(curl -sS -H "Authorization: Bearer $ML_ACCESS_TOKEN" "$ML_API/products/${ID}/items?limit=50" \
-      | jq -r '[.results[].price | select(. != null)] | if length == 0 then empty else min end')
+      | jq -r '[.results // [] | .[].price | select(. != null)] | if length == 0 then empty else min end')
   fi
 
   if [ -z "$CURRENT" ] || [ "$CURRENT" = "null" ]; then
