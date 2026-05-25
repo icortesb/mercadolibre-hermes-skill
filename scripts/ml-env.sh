@@ -46,7 +46,7 @@ _ml_write_env_var() {
     : > "$tmp"
   fi
   printf '%s=%s\n' "$key" "$val" >> "$tmp"
-  mv "$tmp" "$ML_ENV_FILE"
+  \mv -f "$tmp" "$ML_ENV_FILE"
   chmod 600 "$ML_ENV_FILE"
 }
 

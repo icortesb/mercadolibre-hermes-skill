@@ -67,7 +67,7 @@ for ID in $(jq -r 'keys[]' "$TMP"); do
 
   jq --arg id "$ID" --argjson p "$CURRENT" --argjson t "$NOW" \
     '.[$id].history += [{ts:$t, price:$p}] | .[$id].last = $p' \
-    "$TMP" > "${TMP}.new" && mv "${TMP}.new" "$TMP"
+    "$TMP" > "${TMP}.new" && \mv -f "${TMP}.new" "$TMP"
 
   DROP=$(awk -v b="$BASELINE" -v c="$CURRENT" 'BEGIN{ if (b<=0) print 0; else printf "%.2f", (b-c)/b*100 }')
   if awk -v d="$DROP" -v t="$THRESHOLD" 'BEGIN{ exit !(d >= t) }'; then
@@ -75,4 +75,4 @@ for ID in $(jq -r 'keys[]' "$TMP"); do
   fi
 done
 
-mv "$TMP" "$TRACK_FILE"
+\mv -f "$TMP" "$TRACK_FILE"

@@ -113,7 +113,7 @@ TMP="${ML_ENV_FILE}.tmp.$$"
   echo "ML_USER_ID=${USER_ID}"
   echo "ML_EXPIRES_AT=${EXPIRES_AT}"
 } > "$TMP"
-mv "$TMP" "$ML_ENV_FILE"
+\mv -f "$TMP" "$ML_ENV_FILE"
 chmod 600 "$ML_ENV_FILE"
 
 echo
