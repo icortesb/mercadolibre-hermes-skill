@@ -377,24 +377,33 @@ _ml_catalog_url() {
 
 # Search the MercadoLibre catalog and return a compact JSON list of products
 # with their current price (buy_box if available, else min(offers)) and the
-# canonical product URL. Designed to be relayed to the user in chat so they
-# can pick one to track.
-#   ml_search "query"      → top 5 results
-#   ml_search "query" 10   → top N results (max 50)
+# canonical product URL. Products without an active offer are skipped — their
+# catalog pages show "this product is not available" and are not useful to a
+# buyer. To include them anyway, pass `1` as the third argument.
+# Fetches up to 2× the requested limit upstream so the post-filter result set
+# can still meet `limit` when ~half of the catalog hits are inactive.
+#   ml_search "query"          → top 5 buyable results
+#   ml_search "query" 10       → top 10 buyable results (max 50)
+#   ml_search "query" 5 1      → top 5 results including no-offer products
 ml_search() {
-  local query="$1" limit="${2:-5}" site="${ML_SITE:-MLA}"
+  local query="$1" limit="${2:-5}" include_inactive="${3:-0}" site="${ML_SITE:-MLA}"
   [ -n "$query" ] || { echo "ml_search: pass a query" >&2; return 1; }
   ml_load_token || return 1
 
-  local q ids out='[]' info name buybox price permalink
+  local fetch_limit=$(( limit * 2 ))
+  [ "$fetch_limit" -gt 50 ] && fetch_limit=50
+
+  local q ids out='[]' info name buybox price permalink count=0
+  local free_ship installments_qty installments_amt mercadopago
   q=$(printf %s "$query" | jq -sRr @uri)
   ids=$(curl -sS -H "Authorization: Bearer $ML_ACCESS_TOKEN" \
-    "$ML_API/products/search?site_id=${site}&status=active&q=${q}&limit=${limit}" \
+    "$ML_API/products/search?site_id=${site}&status=active&q=${q}&limit=${fetch_limit}" \
     | jq -r '.results[].id')
 
   [ -n "$ids" ] || { echo '[]'; return 0; }
 
   for id in $ids; do
+    [ "$count" -ge "$limit" ] && break
     info=$(curl -sS -H "Authorization: Bearer $ML_ACCESS_TOKEN" "$ML_API/products/$id")
     name=$(echo "$info" | jq -r '.name // empty')
     permalink=$(echo "$info" | jq -r '.permalink // empty')
@@ -405,9 +414,25 @@ ml_search() {
       price=$(curl -sS -H "Authorization: Bearer $ML_ACCESS_TOKEN" "$ML_API/products/$id/items?limit=50" \
         | jq -r '[.results // [] | .[].price | select(. != null)] | if length == 0 then empty else min end')
     fi
+    if [ -z "$price" ] || [ "$price" = "null" ]; then
+      [ "$include_inactive" = "1" ] || continue
+    fi
+    free_ship=$(echo "$info"      | jq -r '.buy_box_winner.shipping.free_shipping // false')
+    installments_qty=$(echo "$info" | jq -r '.buy_box_winner.installments.quantity // empty')
+    installments_amt=$(echo "$info" | jq -r '.buy_box_winner.installments.amount   // empty')
+    mercadopago=$(echo "$info"    | jq -r '.buy_box_winner.accepts_mercadopago // false')
     [ -z "$permalink" ] && permalink=$(_ml_catalog_url "$id" "$site")
-    out=$(printf '%s' "$out" | jq --arg id "$id" --arg name "$name" --arg url "$permalink" --argjson price "${price:-null}" \
-      '. + [{id:$id, name:$name, price:$price, url:$url}]')
+    out=$(printf '%s' "$out" | jq \
+      --arg id "$id" \
+      --arg name "$name" \
+      --arg url "$permalink" \
+      --argjson price "${price:-null}" \
+      --argjson free_shipping "$free_ship" \
+      --argjson installments_qty "${installments_qty:-null}" \
+      --argjson installments_amount "${installments_amt:-null}" \
+      --argjson mercadopago "$mercadopago" \
+      '. + [{id:$id, name:$name, price:$price, url:$url, free_shipping:$free_shipping, installments_qty:$installments_qty, installments_amount:$installments_amount, mercadopago:$mercadopago}]')
+    count=$((count + 1))
   done
   printf '%s' "$out"
 }
