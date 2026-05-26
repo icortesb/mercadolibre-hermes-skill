@@ -554,11 +554,33 @@ While the request is pending, the catalog-based recipes in this skill continue t
 
 ## Operating as an agent (Hermes / Telegram-driven)
 
-When invoked from a chat interface, the agent should always source the env first and then dispatch to one of the high-level helpers exposed by `ml-env.sh`. These functions are idempotent, return a single human-readable line on stdout, and take care of cron management, file locking, and price-fallback logic so the agent can stay declarative.
+When invoked from a chat interface, the agent should always source the env first and then dispatch to one of the high-level helpers exposed by `ml-env.sh`. These functions are idempotent, return a single human-readable line on stdout, and take care of cron management, file locking, dependency installation, and price-fallback logic so the agent can stay declarative.
 
 ```bash
-source ~/.hermes/skills/mercadolibre/scripts/ml-env.sh && ml_load_token
+source <SKILL_DIR>/scripts/ml-env.sh && ml_load_token
 ```
+
+`<SKILL_DIR>` is wherever the host installed the skill (typically `/opt/data/skills/mercadolibre` for Hermes, or `~/.hermes/skills/mercadolibre` for local installs). The `.env` lives at `$HOME/.hermes/.env` — i.e. the home of the **user running the agent process**, NOT the human's interactive shell. On containerised Hermes deployments that's usually `/opt/data/.hermes/.env`; on bare-metal `/home/<user>/.hermes/.env`. Trust `$HOME` — the helpers resolve it automatically.
+
+### First-time OAuth setup (driven by the agent)
+
+If `ml_load_token` returns `ML_REFRESH_TOKEN not set` (or any other "credentials missing" message), guide the user through OAuth conversationally — do NOT tell them to SSH in and run a script. The flow is fully automatable via three helpers:
+
+1. **Ask for an app**: tell the user to create an app at https://developers.mercadolibre.com.ar/devcenter with **Redirect URI = `https://www.google.com`** (MercadoLibre rejects `localhost` URLs in 2024+; google.com is a valid placeholder we'll parse the `?code=` out of) and scopes `read`, `write`, `offline_access`. Ask them to paste the App ID and Secret Key.
+2. **Save credentials**: `ml_oauth_set "<APP_ID>" "<SECRET>" [redirect_uri] [site]`. Defaults to `https://www.google.com` and `MLA`. Override the site if the user is in another country.
+3. **Send the auth URL**: call `ml_oauth_url`, send the resulting URL to the user with this guidance: *"Abrí este link, autorizá la app, el browser te va a redirigir a google.com con un `?code=...` en la barra de direcciones (la página de Google va a cargar normal — eso está bien). Copiame el URL completo de la barra."*
+4. **Exchange the code**: when they paste back, call `ml_oauth_exchange "<pasted_value>"`. It accepts either the raw code or the full URL; in either case it persists the tokens and prints `Authorized as user <id>`.
+5. **Confirm and continue**: once tokens are saved, the user can immediately track/search.
+
+This flow takes <60 seconds end-to-end if the user is responsive. The agent never needs shell-level interactivity.
+
+### "Trackeá X" without an explicit threshold
+
+If the user expresses intent to track ("trackeá la PS5", "seguime este celular", "alertame si baja") but doesn't specify the drop-percentage threshold, **ask once before calling `ml_track_url`**:
+
+> ¿A partir de qué % de baja querés que te alerte? (default 10%)
+
+Wait for their answer. Accept "10", "10%", "el default", "cualquiera está bien" → use the number or 10. Only then call `ml_track_url <id_or_url> <pct>`. This shaves one round-trip for power users who type "trackeá la PS5 al 5%" directly (skip the question if `pct` is already in the message).
 
 ### Intent → command mapping
 
@@ -599,13 +621,24 @@ Always **echo prices using the user's locale** (in the example above, AR pesos w
 
 If the user pastes a MercadoLibre URL instead of describing a product, skip the search step and go directly to `ml_track_url "<url>"`.
 
-### Cron lifecycle
+### Scheduling lifecycle
 
-- **First call to `ml_track_url`** installs the cron line (default: every 4 hours) tagged with `# mercadolibre-skill`.
-- **Last call to `ml_untrack`** (when zero items remain) removes that cron line.
+- **First call to `ml_track_url`** installs a periodic checker (default: every 4 hours) tagged with `# mercadolibre-skill`.
+- **Last call to `ml_untrack`** removes the schedule.
 - Manual control: `ml_install_cron "0 */4 * * *"` and `ml_remove_cron`.
 
-The cron job sources `ml-env.sh`, calls `ml_load_token` (auto-refreshing the access token), then runs the checker.
+The scheduled job sources `ml-env.sh`, calls `ml_load_token` (auto-refreshing the access token), then runs `ml-check-tracked.sh`.
+
+**Two backends, auto-detected:**
+
+- **System cron available** (bare-metal installs, full distros): the helper writes a `crontab` line and removes it on cleanup. No agent involvement needed.
+- **No system cron** (minimal Docker containers — Hermes's own image, Alpine, etc.): `ml_install_cron` prints a hint and exits 0. In this case **the agent itself must register the job in its internal scheduler**:
+  - Every: `0 */4 * * *` (or whatever interval the user wants)
+  - Run: `bash $HOME/.hermes/skills/mercadolibre/scripts/ml-check-tracked.sh`
+  - Make sure the agent sources `ml-env.sh` and calls `ml_load_token` before running the script, so the access token is fresh.
+  - On `ml_untrack` returning "was the last one — agent should unschedule the internal job itself", remove the registered job.
+
+This is why the skill works equally well on a Raspberry Pi with a real cron and inside a Hermes-Docker container with only the agent's scheduler.
 
 ### Delivering alerts to Telegram
 
@@ -631,8 +664,11 @@ If the agent doesn't know the bot credentials, leave push mode disabled and stay
 
 | Task | Command |
 |------|---------|
-| First-time auth | `bash skills/mercadolibre/scripts/ml-oauth.sh` |
-| Install deps | `bash skills/mercadolibre/scripts/install-deps.sh` |
+| Save app creds | `ml_oauth_set <client_id> <secret> [redirect_uri] [site]` |
+| Get auth URL (send to user) | `ml_oauth_url` |
+| Exchange code for tokens | `ml_oauth_exchange "<code_or_full_url>"` |
+| First-time auth (interactive CLI) | `bash skills/mercadolibre/scripts/ml-oauth.sh` |
+| Install deps (auto-run on demand) | `bash skills/mercadolibre/scripts/install-deps.sh` |
 | Load + refresh token | `source skills/mercadolibre/scripts/ml-env.sh && ml_load_token` |
 | Force refresh | `ml_refresh_token` |
 | Catalog search (chat-ready) | `ml_search "<query>" [limit]` |

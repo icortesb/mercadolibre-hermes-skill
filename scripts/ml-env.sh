@@ -21,11 +21,21 @@ _ml_check_deps() {
   local missing=()
   command -v curl >/dev/null 2>&1 || missing+=(curl)
   command -v jq   >/dev/null 2>&1 || missing+=(jq)
+  [ ${#missing[@]} -eq 0 ] && return 0
+
+  local here
+  here="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
+  echo "ml-env: missing tools (${missing[*]}) — auto-installing..." >&2
+  if [ -x "${here}/install-deps.sh" ]; then
+    bash "${here}/install-deps.sh" >&2 || true
+  fi
+
+  # Re-check; bail with a clear message if still missing
+  missing=()
+  command -v curl >/dev/null 2>&1 || missing+=(curl)
+  command -v jq   >/dev/null 2>&1 || missing+=(jq)
   if [ ${#missing[@]} -gt 0 ]; then
-    local here
-    here="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd)"
-    echo "ml-env: missing required tools: ${missing[*]}" >&2
-    echo "  Run: bash ${here:-scripts}/install-deps.sh" >&2
+    echo "ml-env: still missing: ${missing[*]} — install manually (no sudo, no apt?)" >&2
     return 1
   fi
 }
@@ -48,6 +58,101 @@ _ml_write_env_var() {
   printf '%s=%s\n' "$key" "$val" >> "$tmp"
   \mv -f "$tmp" "$ML_ENV_FILE"
   chmod 600 "$ML_ENV_FILE"
+}
+
+# =====================================================================
+# OAuth setup helpers (agent-driven; replace the interactive ml-oauth.sh)
+# =====================================================================
+
+# Auth host per MercadoLibre site code.
+_ml_auth_host() {
+  case "${1:-MLA}" in
+    MLA) echo "https://auth.mercadolibre.com.ar" ;;
+    MLB) echo "https://auth.mercadolivre.com.br" ;;
+    MLM) echo "https://auth.mercadolibre.com.mx" ;;
+    MLC) echo "https://auth.mercadolibre.cl"     ;;
+    MCO) echo "https://auth.mercadolibre.com.co" ;;
+    MLU) echo "https://auth.mercadolibre.com.uy" ;;
+    *)   return 1 ;;
+  esac
+}
+
+# Persist app credentials to the .env. Call before ml_oauth_url.
+#   ml_oauth_set CLIENT_ID CLIENT_SECRET [REDIRECT_URI] [SITE]
+ml_oauth_set() {
+  local cid="$1" csec="$2" redir="${3:-https://www.google.com}" site="${4:-MLA}"
+  [ -n "$cid" ] && [ -n "$csec" ] || { _ml_die "ml_oauth_set: pass client_id and client_secret"; return 1; }
+  _ml_auth_host "$site" >/dev/null || { _ml_die "unknown site: $site (MLA/MLB/MLM/MLC/MCO/MLU)"; return 1; }
+  mkdir -p "$(dirname "$ML_ENV_FILE")"
+  touch "$ML_ENV_FILE"; chmod 600 "$ML_ENV_FILE"
+  _ml_write_env_var ML_CLIENT_ID     "$cid"
+  _ml_write_env_var ML_CLIENT_SECRET "$csec"
+  _ml_write_env_var ML_REDIRECT_URI  "$redir"
+  _ml_write_env_var ML_SITE          "$site"
+  echo "Credentials saved. Next: call ml_oauth_url to get the authorization URL."
+}
+
+# Print the MercadoLibre authorization URL for the configured app.
+# Send this to the user; after they authorize, they paste back the redirected URL.
+ml_oauth_url() {
+  _ml_check_deps || return 1
+  _ml_read_env   || return 1
+  [ -n "${ML_CLIENT_ID:-}" ]    || { _ml_die "ML_CLIENT_ID not set — call ml_oauth_set first"; return 1; }
+  [ -n "${ML_REDIRECT_URI:-}" ] || { _ml_die "ML_REDIRECT_URI not set — call ml_oauth_set first"; return 1; }
+  local host enc
+  host=$(_ml_auth_host "${ML_SITE:-MLA}") || return 1
+  enc=$(printf %s "$ML_REDIRECT_URI" | jq -sRr @uri)
+  echo "${host}/authorization?response_type=code&client_id=${ML_CLIENT_ID}&redirect_uri=${enc}"
+}
+
+# Exchange an authorization code for access/refresh tokens and persist them.
+# Accept either the raw code or the full redirected URL — we extract code= either way.
+#   ml_oauth_exchange "TG-abc..."  OR  ml_oauth_exchange "https://...?code=TG-abc..."
+ml_oauth_exchange() {
+  local input="$1" code
+  [ -n "$input" ] || { _ml_die "ml_oauth_exchange: pass the code or the full redirected URL"; return 1; }
+  if printf %s "$input" | grep -q '://'; then
+    code=$(printf %s "$input" | sed -n 's|.*[?&]code=\([^&]*\).*|\1|p')
+  else
+    code="$input"
+  fi
+  [ -n "$code" ] || { _ml_die "could not extract code from input"; return 1; }
+
+  _ml_check_deps || return 1
+  _ml_read_env   || return 1
+  [ -n "${ML_CLIENT_ID:-}" ]     || { _ml_die "ML_CLIENT_ID not set";     return 1; }
+  [ -n "${ML_CLIENT_SECRET:-}" ] || { _ml_die "ML_CLIENT_SECRET not set"; return 1; }
+  [ -n "${ML_REDIRECT_URI:-}" ]  || { _ml_die "ML_REDIRECT_URI not set";  return 1; }
+
+  local resp
+  resp=$(curl -fsS -X POST "$ML_API/oauth/token" \
+    -H "Accept: application/json" \
+    -H "Content-Type: application/x-www-form-urlencoded" \
+    -d "grant_type=authorization_code" \
+    -d "client_id=${ML_CLIENT_ID}" \
+    -d "client_secret=${ML_CLIENT_SECRET}" \
+    -d "code=${code}" \
+    -d "redirect_uri=${ML_REDIRECT_URI}") || { _ml_die "exchange failed — check the code/credentials"; return 1; }
+
+  local access refresh expires_in user_id
+  access=$(echo "$resp"     | jq -r '.access_token  // empty')
+  refresh=$(echo "$resp"    | jq -r '.refresh_token // empty')
+  expires_in=$(echo "$resp" | jq -r '.expires_in    // empty')
+  user_id=$(echo "$resp"    | jq -r '.user_id       // empty')
+
+  if [ -z "$access" ] || [ -z "$refresh" ]; then
+    _ml_die "unexpected exchange response: $resp"
+    return 1
+  fi
+
+  local expires_at=$(( $(date +%s) + expires_in - 60 ))
+  _ml_write_env_var ML_ACCESS_TOKEN  "$access"
+  _ml_write_env_var ML_REFRESH_TOKEN "$refresh"
+  _ml_write_env_var ML_USER_ID       "$user_id"
+  _ml_write_env_var ML_EXPIRES_AT    "$expires_at"
+  export ML_ACCESS_TOKEN="$access" ML_REFRESH_TOKEN="$refresh" ML_USER_ID="$user_id" ML_EXPIRES_AT="$expires_at"
+
+  echo "Authorized as user $user_id. Tokens written to $ML_ENV_FILE."
 }
 
 ml_refresh_token() {
@@ -159,8 +264,18 @@ ml_url_to_product_id() {
 
 # Install the periodic checker cron job. Idempotent — leaves the crontab alone
 # if our tag is already present. Default interval: every 4 hours.
+#
+# Gracefully degrades when the host has no `crontab` binary (typical of minimal
+# Docker containers like the Hermes image): prints a hint asking the agent
+# (Hermes / similar) to schedule the checker via its own internal scheduler.
 ml_install_cron() {
   local interval="${1:-0 */4 * * *}"
+  if ! command -v crontab >/dev/null 2>&1; then
+    echo "no system cron — schedule this with the agent's internal scheduler:" >&2
+    echo "  every: $interval" >&2
+    echo "  run:   bash \$HOME/.hermes/skills/mercadolibre/scripts/ml-check-tracked.sh" >&2
+    return 0
+  fi
   if crontab -l 2>/dev/null | grep -qF "$ML_CRON_TAG"; then
     echo "cron already installed"
     return 0
@@ -170,8 +285,14 @@ ml_install_cron() {
   echo "cron installed ($interval)"
 }
 
-# Remove our cron line.
+# Remove our cron line. Silent no-op if the host has no crontab (assumes the
+# agent's internal scheduler is being used instead, which the agent unschedules
+# on its own).
 ml_remove_cron() {
+  if ! command -v crontab >/dev/null 2>&1; then
+    echo "no system cron — agent should unschedule the internal job itself" >&2
+    return 0
+  fi
   if ! crontab -l 2>/dev/null | grep -qF "$ML_CRON_TAG"; then
     echo "no cron to remove"
     return 0

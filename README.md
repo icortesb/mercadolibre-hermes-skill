@@ -88,7 +88,15 @@ The agent never needs to call MercadoLibre directly — it only calls the helper
 
 ## Install
 
-Clone the skill into Hermes's skills directory on the host that runs the agent (typically a server / VPS):
+### Recommended (Hermes agent)
+
+Ask your agent to install it for you. From Telegram (or any Hermes interface):
+
+> Install the mercadolibre skill from https://github.com/icortesb/mercadolibre-hermes-skill
+
+Hermes uses `skill_manage` to clone the repo into the right directory inside its container with correct ownership. After that, ask the agent to set up OAuth and it will walk you through it conversationally — no SSH or manual config required (see [Use from chat](#use-from-chat)).
+
+### Manual (bare metal / no agent)
 
 ```bash
 mkdir -p ~/.hermes/skills
@@ -97,13 +105,13 @@ git clone https://github.com/icortesb/mercadolibre-hermes-skill mercadolibre
 chmod +x mercadolibre/scripts/*.sh
 ```
 
-Install runtime dependencies (`curl`, `jq`) — the bundled helper auto-detects your package manager:
+Runtime dependencies (`curl`, `jq`) **install automatically on first use** — `ml-env.sh` detects missing tools and runs `install-deps.sh` itself. If your environment can't install packages automatically (no sudo, locked-down container), pre-install manually:
 
 ```bash
 bash ~/.hermes/skills/mercadolibre/scripts/install-deps.sh
 ```
 
-Supported package managers: `apt`, `dnf`, `yum`, `apk`, `pacman`, `zypper`, `brew`. If your system isn't covered (or installation is blocked by inotify/fd limits on a small VPS), install `curl` and `jq` manually — e.g. for `jq` you can download a static binary from https://jqlang.github.io/jq/download/.
+Supported package managers: `apt`, `dnf`, `yum`, `apk`, `pacman`, `zypper`, `brew`. As a fallback, install `curl` and `jq` by other means — e.g. a static `jq` binary from https://jqlang.github.io/jq/download/.
 
 ---
 
