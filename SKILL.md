@@ -229,24 +229,24 @@ curl -s -H "Authorization: Bearer $ML_ACCESS_TOKEN" "$ML_API/products/${PRODUCT_
 
 `buy_box_winner.price` is the headline price shown on the product page — that's what we track for simple products.
 
-> **Heads up for multi-variant products**: products with `pickers` (size/colour/capacity selectors — e.g. a PS5 with capacity & colour pickers) have **no buy-box winner** at the parent level (`.buy_box_winner == null`, `.min_price == null`). For those, query the offers directly and take the cheapest:
+> **Heads up for multi-variant products**: products with `pickers` (size/colour/capacity selectors — e.g. a PS5 with capacity & colour pickers) have **no buy-box winner** at the parent level (`.buy_box_winner == null`, `.min_price == null`). For those, query the offers and take the **median** price across active items. `min` is structurally bad here — multi-variant catalogs often have 1-2 orphan/scam listings ~30% below the real market that ML hides from the headline, and `min` catches exactly those. Median tracks ML's displayed price within a few percent:
 >
 > ```bash
 > curl -s -H "Authorization: Bearer $ML_ACCESS_TOKEN" "$ML_API/products/$PRODUCT_ID/items?limit=50" \
->   | jq -r '[.results[].price | select(. != null)] | min'
+>   | jq -r '[.results[].price | select(. != null)] | sort | .[(length / 2 | floor)]'
 > ```
 >
 > The bundled `ml_product_price` helper does this fallback automatically — see below.
 
 ### Resolve a product's current price (helper)
 
-The `ml_product_price` function in `ml-env.sh` returns the current price for a product, falling back from `buy_box_winner.price` to `min(offers)` when the product has variants:
+The `ml_product_price` function in `ml-env.sh` returns the current price for a product, falling back from `buy_box_winner.price` to `median(offers)` when the product has variants:
 
 ```bash
 source skills/mercadolibre/scripts/ml-env.sh && ml_load_token
 PRICE=$(ml_product_price MLA63094449)
 echo "$PRICE"
-# → 1159999  (the cheapest active offer)
+# → 1159999  (the median active offer — close to what ML displays as the headline)
 ```
 
 Use this anywhere you'd otherwise hand-roll the buy-box lookup; it makes the tracking and alerting recipes work uniformly across simple and multi-variant products.

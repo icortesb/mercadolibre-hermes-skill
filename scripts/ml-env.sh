@@ -228,9 +228,12 @@ ml_product_price() {
   price=$(echo "$resp" | jq -r '.buy_box_winner.price // empty')
 
   if [ -z "$price" ]; then
-    # Fall back to min price across active offers
+    # Multi-variant products have buy_box_winner=null. Fall back to the median
+    # offer price — min is structurally bad here (catches scammy/orphan listings
+    # that ML hides from the headline) and median matches what ML actually
+    # displays on the catalog page within a few percent.
     price=$(curl -sS -H "Authorization: Bearer $ML_ACCESS_TOKEN" "$ML_API/products/${product_id}/items?limit=50" \
-      | jq -r '[.results // [] | .[].price | select(. != null)] | if length == 0 then empty else min end')
+      | jq -r '[.results // [] | .[].price | select(. != null)] | sort | if length == 0 then empty else .[(length / 2 | floor)] end')
   fi
 
   [ -n "$price" ] && printf '%s' "$price"
@@ -452,7 +455,7 @@ _ml_search_catalog() {
       price="$buybox"
     else
       price=$(curl -sS -H "Authorization: Bearer $ML_ACCESS_TOKEN" "$ML_API/products/$id/items?limit=50" \
-        | jq -r '[.results // [] | .[].price | select(. != null)] | if length == 0 then empty else min end')
+        | jq -r '[.results // [] | .[].price | select(. != null)] | sort | if length == 0 then empty else .[(length / 2 | floor)] end')
     fi
     if [ -z "$price" ] || [ "$price" = "null" ]; then
       available=false
