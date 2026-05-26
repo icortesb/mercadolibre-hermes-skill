@@ -179,6 +179,8 @@ All endpoints require `Authorization: Bearer ${ML_ACCESS_TOKEN}`. Even reads tha
 > ### Heads-up: non-validated apps have catalog restrictions
 >
 > A freshly-created MercadoLibre app can hit `/users/me`, `/users/$ID/items/...` (your own data), and the **catalog/product API** (`/products/*`) — but **`/items/{id}` and `/sites/$SITE/search` return `403 access_denied` until the app is validated** by MercadoLibre. For most buyer flows the catalog API is actually a better choice (it aggregates all sellers for a product, exposes a `buy_box_winner.price`, and keeps the same ID even when individual listings come and go). The recipes below default to `/products/*`. If your app is validated and you want item-level data, see "App validation" near the end.
+>
+> `ml_search` handles this transparently: on first call it probes `/sites/$SITE/search` and caches the result in `~/.hermes/mercadolibre/.search_mode_$SITE`. Validated apps get the broader items endpoint (thousands of results, MercadoLibre-web parity); non-validated apps fall back to the catalog endpoint (curated, fewer results). Same JSON shape either way — the agent does not branch on the backend. After requesting validation, run `ml_reset_search_mode` to clear the cache and re-probe.
 
 ---
 
@@ -542,6 +544,8 @@ If you do need item-level access (e.g. tracking used items that aren't in the ca
 
 While the request is pending, the catalog-based recipes in this skill continue to work as-is.
 
+Once validation lands, run `ml_reset_search_mode` once so `ml_search` re-probes and starts using `/sites/$SITE/search` (thousands of results, same shape — no other code changes needed).
+
 ---
 
 ## Privacy and safety
@@ -602,8 +606,14 @@ After mutating helpers (`ml_track_url`, `ml_untrack`), relay the helper's stdout
 
 When the user mentions a product casually ("estoy por comprar una PS5", "looking for AirPods Pro", "necesito una notebook gamer") **do not assume they want to track immediately**. Instead:
 
-1. Call `ml_search "<their product>"` and parse the JSON. Each result has `{id, name, price, available, url, free_shipping, installments_qty, installments_amount, mercadopago}` — the `id` is for your internal use (so you can pass it to `ml_track_url`), the `url` is the canonical MercadoLibre product page. Results are in catalog relevance order (correlates with popularity).
+1. Call `ml_search "<their product>"` (default limit 20; raise via `ml_search "X" 50` if the user wants more) and parse the JSON. Each result has `{id, name, price, available, url, free_shipping, installments_qty, installments_amount, mercadopago}` — the `id` is for your internal use (so you can pass it to `ml_track_url`), the `url` is the canonical MercadoLibre product page. Results are in catalog relevance order (correlates with popularity).
 2. **Split results into two groups**: products where `available=true` (have a current price) come first as the main list. Products where `available=false` go in a secondary "sin stock ahora" group — their catalog page shows "this product is not available", so it's important the user knows before clicking.
+
+   **If the first call returns few or mostly-unavailable hits** (catalog mode is curated and short-tail queries like "nintendo switch" sometimes return accessories or unrelated SKUs), don't surface that to the user — silently refine and retry once or twice:
+   - Add the product type word the user implied (`"nintendo switch consola"`, `"airpods pro auriculares"`, `"notebook gamer laptop"`).
+   - Or narrow with a `domain_id`: `ml_search "nintendo switch" 20 MLA-VIDEO_GAME_CONSOLES`. Common domains: `MLA-CELLPHONES`, `MLA-NOTEBOOKS`, `MLA-VIDEO_GAME_CONSOLES`, `MLA-HEADPHONES`, `MLA-SNEAKERS`. If you don't know the right one, peek at `domain_id` from a first-pass result.
+   - Or drop the over-generic word and try a model name (`"switch oled"` instead of `"nintendo"`).
+   Only ask the user to clarify when two or three auto-refinements still come back empty — they wrote what they wrote on purpose.
 
 3. Present them in a Telegram-friendly format with a numeric index. **Show title, price, link, and any positive trust signals** (free shipping, installments). **Do not show the catalog ID to the user** (it's not actionable for them):
 
@@ -623,8 +633,8 @@ When the user mentions a product casually ("estoy por comprar una PS5", "looking
    Only mention positive signals — skip the line if `free_shipping=false`, `installments_qty=null`, etc. Don't say "no tiene envío gratis", just omit it. If the available group is empty, lead with the unavailable group and suggest a different query.
 
 4. Ask a follow-up: "Querés que trackee alguno? Decime el número o pegame el link, y si querés a partir de qué % de baja te aviso. Los sin stock también los puedo trackear y avisarte cuando vuelvan."
-4. On the next turn, if the user picks one ("trackeá el 1", "el más barato", "trackeá MLA63094449 al 10%"), call `ml_track_url <id> [pct]` with the chosen ID and the threshold (default 10%).
-5. If the user wants to refine ("busca el modelo Pro", "muestra usados") → call `ml_search` again with the refined query.
+5. On the next turn, if the user picks one ("trackeá el 1", "el más barato", "trackeá MLA63094449 al 10%"), call `ml_track_url <id> [pct]` with the chosen ID and the threshold (default 10%).
+6. If the user wants to refine ("busca el modelo Pro", "muestra usados") → call `ml_search` again with the refined query.
 
 Always **echo prices using the user's locale** (in the example above, AR pesos with `.` as thousands separator). The skill returns raw integers — you do the formatting.
 
@@ -680,7 +690,8 @@ If the agent doesn't know the bot credentials, leave push mode disabled and stay
 | Install deps (auto-run on demand) | `bash skills/mercadolibre/scripts/install-deps.sh` |
 | Load + refresh token | `source skills/mercadolibre/scripts/ml-env.sh && ml_load_token` |
 | Force refresh | `ml_refresh_token` |
-| Catalog search (chat-ready) | `ml_search "<query>" [limit]` |
+| Catalog search (chat-ready, auto-detects items vs catalog) | `ml_search "<query>" [limit] [domain_id]` |
+| Re-probe search mode after app validation | `ml_reset_search_mode` |
 | Track from URL or ID | `ml_track_url <url\|id> [pct]` |
 | Untrack | `ml_untrack <id>` |
 | List tracked | `ml_list_tracked` |

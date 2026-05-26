@@ -375,25 +375,70 @@ _ml_catalog_url() {
   printf 'https://www.%s/p/%s' "$domain" "$id"
 }
 
-# Search the MercadoLibre catalog and return a compact JSON list of products
-# with their current price (buy_box if available, else min(offers)), the
-# canonical product URL, and shipping/installments signals. Products without
-# an active offer come through with `price: null` and `available: false` —
-# the agent should present them separately so the user knows the link will
-# show "not available" if clicked.
-# Results are in catalog relevance order (correlates with popularity).
-#   ml_search "query"      → top 5 results
-#   ml_search "query" 10   → top N results (max 50)
-ml_search() {
-  local query="$1" limit="${2:-5}" site="${ML_SITE:-MLA}"
-  [ -n "$query" ] || { echo "ml_search: pass a query" >&2; return 1; }
-  ml_load_token || return 1
+# Probe whether the current app has access to the items search endpoint
+# (/sites/$SITE/search), which is only granted to validated apps. Caches
+# the result in a marker file so we don't probe on every call.
+# Returns "items" or "catalog" on stdout.
+_ml_search_mode() {
+  local site="${ML_SITE:-MLA}"
+  local cache="${ML_TRACK_DIR:-$HOME/.hermes/mercadolibre}/.search_mode_${site}"
+  if [ -f "$cache" ]; then
+    cat "$cache"
+    return 0
+  fi
+  mkdir -p "$(dirname "$cache")"
+  local status
+  status=$(curl -sS -o /dev/null -w '%{http_code}' \
+    -H "Authorization: Bearer $ML_ACCESS_TOKEN" \
+    "$ML_API/sites/$site/search?q=test&limit=1")
+  if [ "$status" = "200" ]; then
+    echo "items" | tee "$cache"
+  else
+    echo "catalog" | tee "$cache"
+  fi
+}
 
-  local q ids out='[]' info name buybox price permalink available
+# Force a re-probe of the items endpoint (call after app validation lands).
+ml_reset_search_mode() {
+  local site="${ML_SITE:-MLA}"
+  rm -f "${ML_TRACK_DIR:-$HOME/.hermes/mercadolibre}/.search_mode_${site}"
+  echo "search mode cache cleared; next ml_search will re-probe"
+}
+
+# Search via /sites/$SITE/search — only works on validated apps.
+# Returns the same JSON shape as ml_search (catalog mode) so the agent does
+# not need to branch on the backend. `id` is the catalog_product_id when the
+# item is part of a catalog, falling back to the item id otherwise.
+_ml_search_items() {
+  local query="$1" limit="$2" site="$3" domain_id="$4"
+  local q url
+  q=$(printf %s "$query" | jq -sRr @uri)
+  url="$ML_API/sites/$site/search?q=${q}&limit=${limit}"
+  [ -n "$domain_id" ] && url="${url}&domain_id=${domain_id}"
+  curl -sS -H "Authorization: Bearer $ML_ACCESS_TOKEN" "$url" | jq '
+    [(.results // [])[] | {
+      id: (.catalog_product_id // .id),
+      name: .title,
+      price: .price,
+      available: ((.price // null) != null and (.available_quantity // 0) > 0),
+      url: .permalink,
+      free_shipping: (.shipping.free_shipping // false),
+      installments_qty: (.installments.quantity // null),
+      installments_amount: (.installments.amount // null),
+      mercadopago: (.accepts_mercadopago // false)
+    }]'
+}
+
+# Search via /products/search — works on every authenticated app but returns
+# fewer, more curated catalog entries.
+_ml_search_catalog() {
+  local query="$1" limit="$2" site="$3" domain_id="$4"
+  local q url ids out='[]' info name buybox price permalink available
   local free_ship installments_qty installments_amt mercadopago
   q=$(printf %s "$query" | jq -sRr @uri)
-  ids=$(curl -sS -H "Authorization: Bearer $ML_ACCESS_TOKEN" \
-    "$ML_API/products/search?site_id=${site}&status=active&q=${q}&limit=${limit}" \
+  url="$ML_API/products/search?site_id=${site}&status=active&q=${q}&limit=${limit}"
+  [ -n "$domain_id" ] && url="${url}&domain_id=${domain_id}"
+  ids=$(curl -sS -H "Authorization: Bearer $ML_ACCESS_TOKEN" "$url" \
     | jq -r '.results[].id')
 
   [ -n "$ids" ] || { echo '[]'; return 0; }
@@ -432,6 +477,33 @@ ml_search() {
       '. + [{id:$id, name:$name, price:$price, available:$available, url:$url, free_shipping:$free_shipping, installments_qty:$installments_qty, installments_amount:$installments_amount, mercadopago:$mercadopago}]')
   done
   printf '%s' "$out"
+}
+
+# Search the MercadoLibre catalog and return a compact JSON list of products
+# with current price, canonical URL, and shipping/installments signals.
+# Auto-detects whether the current app can use the broader items search
+# endpoint (/sites/$SITE/search, validated apps only). If yes, uses it for
+# thousands of richer results — same UX as MercadoLibre's web search. If no,
+# falls back to the catalog endpoint (/products/search) which works on every
+# authenticated app but returns fewer, more curated results.
+# Each result has `{id, name, price, available, url, free_shipping,
+# installments_qty, installments_amount, mercadopago}` regardless of backend.
+#   ml_search "query"                       → top 20 results
+#   ml_search "query" 10                    → top N (max 50)
+#   ml_search "query" 20 MLA-VIDEO_GAME_CONSOLES  → constrain to a domain
+ml_search() {
+  local query="$1" limit="${2:-20}" domain_id="$3" site="${ML_SITE:-MLA}"
+  [ -n "$query" ] || { echo "ml_search: pass a query" >&2; return 1; }
+  ml_load_token || return 1
+  [ "$limit" -gt 50 ] && limit=50
+
+  local mode
+  mode=$(_ml_search_mode)
+  if [ "$mode" = "items" ]; then
+    _ml_search_items "$query" "$limit" "$site" "$domain_id"
+  else
+    _ml_search_catalog "$query" "$limit" "$site" "$domain_id"
+  fi
 }
 
 # Print recent ALERT lines from the log. Default window: 24 hours.
