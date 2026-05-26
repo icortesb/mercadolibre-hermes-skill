@@ -359,9 +359,26 @@ ml_list_tracked() {
   jq 'to_entries | map({id:.key, title:.value.title, baseline:.value.baseline, last:.value.last, threshold_pct:.value.threshold_pct, drop_pct: (if .value.baseline > 0 then ((.value.baseline - .value.last) / .value.baseline * 100 | floor) else 0 end)})' "$ML_TRACK_FILE"
 }
 
+# Build a catalog product URL from an ID and site code. Used as a fallback
+# when the API does not return a permalink.
+_ml_catalog_url() {
+  local id="$1" site="${2:-${ML_SITE:-MLA}}" domain
+  case "$site" in
+    MLA) domain='mercadolibre.com.ar' ;;
+    MLB) domain='mercadolivre.com.br' ;;
+    MLM) domain='mercadolibre.com.mx' ;;
+    MLC) domain='mercadolibre.cl'     ;;
+    MCO) domain='mercadolibre.com.co' ;;
+    MLU) domain='mercadolibre.com.uy' ;;
+    *)   domain='mercadolibre.com'    ;;
+  esac
+  printf 'https://www.%s/p/%s' "$domain" "$id"
+}
+
 # Search the MercadoLibre catalog and return a compact JSON list of products
-# with their current price (buy_box if available, else min(offers)). Designed
-# to be relayed to the user in chat so they can pick one to track.
+# with their current price (buy_box if available, else min(offers)) and the
+# canonical product URL. Designed to be relayed to the user in chat so they
+# can pick one to track.
 #   ml_search "query"      → top 5 results
 #   ml_search "query" 10   → top N results (max 50)
 ml_search() {
@@ -369,7 +386,7 @@ ml_search() {
   [ -n "$query" ] || { echo "ml_search: pass a query" >&2; return 1; }
   ml_load_token || return 1
 
-  local q ids out='[]' info name buybox price
+  local q ids out='[]' info name buybox price permalink
   q=$(printf %s "$query" | jq -sRr @uri)
   ids=$(curl -sS -H "Authorization: Bearer $ML_ACCESS_TOKEN" \
     "$ML_API/products/search?site_id=${site}&status=active&q=${q}&limit=${limit}" \
@@ -380,6 +397,7 @@ ml_search() {
   for id in $ids; do
     info=$(curl -sS -H "Authorization: Bearer $ML_ACCESS_TOKEN" "$ML_API/products/$id")
     name=$(echo "$info" | jq -r '.name // empty')
+    permalink=$(echo "$info" | jq -r '.permalink // empty')
     buybox=$(echo "$info" | jq -r '.buy_box_winner.price // empty')
     if [ -n "$buybox" ]; then
       price="$buybox"
@@ -387,8 +405,9 @@ ml_search() {
       price=$(curl -sS -H "Authorization: Bearer $ML_ACCESS_TOKEN" "$ML_API/products/$id/items?limit=50" \
         | jq -r '[.results // [] | .[].price | select(. != null)] | if length == 0 then empty else min end')
     fi
-    out=$(printf '%s' "$out" | jq --arg id "$id" --arg name "$name" --argjson price "${price:-null}" \
-      '. + [{id:$id, name:$name, price:$price}]')
+    [ -z "$permalink" ] && permalink=$(_ml_catalog_url "$id" "$site")
+    out=$(printf '%s' "$out" | jq --arg id "$id" --arg name "$name" --arg url "$permalink" --argjson price "${price:-null}" \
+      '. + [{id:$id, name:$name, price:$price, url:$url}]')
   done
   printf '%s' "$out"
 }

@@ -602,18 +602,20 @@ After mutating helpers (`ml_track_url`, `ml_untrack`), relay the helper's stdout
 
 When the user mentions a product casually ("estoy por comprar una PS5", "looking for AirPods Pro", "necesito una notebook gamer") **do not assume they want to track immediately**. Instead:
 
-1. Call `ml_search "<their product>"` and parse the JSON.
-2. Present the top results in a Telegram-friendly format with a numeric index:
+1. Call `ml_search "<their product>"` and parse the JSON. Each result has `{id, name, price, url}` — the `id` is for your internal use (so you can pass it to `ml_track_url`), the `url` is the canonical MercadoLibre product page.
+2. Present the top results in a Telegram-friendly format with a numeric index. **Show title, price, and link** — do not show the catalog ID to the user (it's not actionable for them):
 
    ```
    1. Sony Playstation 5 consola Slim Digital + Astro Bot + GT7  —  $990.000
-      ID: MLA63094449
+      https://www.mercadolibre.com.ar/p/MLA63094449
    2. Sony Playstation 5 consola Slim Digital  —  $1.050.000
-      ID: MLA60875568
+      https://www.mercadolibre.com.ar/p/MLA60875568
    3. ...
    ```
 
-3. Ask a follow-up: "Querés que trackee alguno? Decime el número, el ID, o si querés que busque otra cosa."
+   If `price` is `null` (no active offers), say "sin oferta activa" instead of a price.
+
+3. Ask a follow-up: "Querés que trackee alguno? Decime el número o pegame el link, y si querés a partir de qué % de baja te aviso."
 4. On the next turn, if the user picks one ("trackeá el 1", "el más barato", "trackeá MLA63094449 al 10%"), call `ml_track_url <id> [pct]` with the chosen ID and the threshold (default 10%).
 5. If the user wants to refine ("busca el modelo Pro", "muestra usados") → call `ml_search` again with the refined query.
 
